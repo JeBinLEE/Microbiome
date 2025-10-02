@@ -61,7 +61,6 @@ You can override these before running Snakemake:
 | `MA_DIR`           | `GutBiomeTech/MicrobiomeAnalyst` | Base path for MicrobiomeAnalyst files                            |
 | `MA_OUTDIR`        | `${MA_DIR}/results_R_test_MA2`   | Output dir for the full MicrobiomeAnalyst pipeline               |
 | `MA_GROUP`         | `Group1`                         | Metadata column used as experimental group                       |
-| `RAREFY_Q`         | `0.00`                           | Rarefaction depth policy: `0.00` = use minimum; `0–1` = quantile |
 | `LEFSE_OUTDIR`     | `/home/.../04_LEfse`             | Output dir for pairwise LEfSe results                            |
 | `RS_BIN`           | `/usr/bin/Rscript`               | Path to Rscript binary                                           |
 
