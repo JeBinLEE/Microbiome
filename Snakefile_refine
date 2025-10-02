@@ -24,7 +24,7 @@ MA_DIR       = os.environ.get("MA_DIR", "GutBiomeTech/MicrobiomeAnalyst")
 MA_UPLOAD_DIR = f"{MA_DIR}/upload"  # feature/tax/meta 업로드 파일 위치
 MA_OUTDIR    = os.environ.get("MA_OUTDIR", f"{MA_DIR}/results_R_test_MA2")
 MA_GROUP     = os.environ.get("MA_GROUP", "Group1")    # 메타데이터의 그룹 열명
-RAREFY_Q     = os.environ.get("RAREFY_Q", "0.00")      # 0.00이면 min, 0~1이면 quantile
+# RAREFY_Q     = os.environ.get("RAREFY_Q", "0.00")      # 0.00이면 min, 0~1이면 quantile
 
 # LEfSe 전용 출력 디렉토리
 LEFSE_OUTDIR = os.environ.get(
@@ -169,7 +169,7 @@ rule run_microbiomeanalyst_pipeline:
     params:
         outdir = MA_OUTDIR,
         group  = MA_GROUP,
-        rq     = RAREFY_Q
+        #rq     = RAREFY_Q
     shell:
         r"""
         set -euo pipefail
@@ -180,7 +180,7 @@ rule run_microbiomeanalyst_pipeline:
           --meta_fp "{input.meta}" \
           --outdir  "{params.outdir}" \
           --group   "{params.group}" \
-          --rarefy_q {params.rq}
+          #--rarefy_q {params.rq}
         date > "{output}"
         """
 
@@ -199,7 +199,7 @@ rule run_microbiomeanalyst_pairwise:
     params:
         outdir = LEFSE_OUTDIR,
         group  = MA_GROUP,
-        rq     = RAREFY_Q
+        #rq     = RAREFY_Q
     shell:
         r"""
         set -euo pipefail
@@ -210,7 +210,7 @@ rule run_microbiomeanalyst_pairwise:
           --meta_fp "$(realpath "{input.meta}")" \
           --outdir  "$(realpath -m "{params.outdir}")" \
           --group   "{params.group}" \
-          --rarefy_q {params.rq}
+          #--rarefy_q {params.rq}
         date > "{output}"
         """
 
