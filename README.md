@@ -24,8 +24,7 @@ This repository tracks only the workflow code and essential artifacts (e.g., YAM
 
 - **Snakemake**
 - **QIIME2**
-- **R (Rscript)** with: `MicrobiomeAnalystR`, `phyloseq`, `dplyr`, `ggplot2`, `readr`
-
+- **R (Rscript)** with: c("readr", "dplyr", "tibble", "stringr","ggplot2", "ggprism", "ggpicrust2", "rlang","optparse", "data.table", "pheatmap", "reshape2","vegan", "phyloseq", "withr", "tidyr","MicrobiomeAnalystR")
 ---
 
 ## 1) Install via Conda/Mamba (YAML)
