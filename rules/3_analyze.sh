@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-ANALYSIS="${ANALYSIS:-blast_results}"
+ANALYSIS="${ANALYSIS:-vsearch_results}"
 REF_DIR="${REF_DIR:-NCBI-RefSeq-16s-202505}"
 THREADS_CUTADAPT="${THREADS_CUTADAPT:-24}"
 THREADS_BLAST="${THREADS_BLAST:-48}"
@@ -62,16 +62,16 @@ qiime feature-table tabulate-seqs --i-data "$REP_QZA" --o-visualization "$REP_DI
 qiime tools export --input-path "$REP_DIR/rep-seqs-dada2-2.qzv" --output-path "$REP_DIR"
 
 # ---- BLAST 분류 1차 ----
-BLASTDB="$REF_DIR/ncbi-refseqs-blastdb.qza"
+BLASTDB="$REF_DIR/ncbi-refseqs-derep.qza"
 TAX_DEREP="$REF_DIR/ncbi-refseqs-taxonomy-derep.qza"
-SEARCH1="$ANALYSIS/blast_results.qza"
-TAX1="$ANALYSIS/taxonomy_blast.qza"
-qiime feature-classifier classify-consensus-blast \
+SEARCH1="$ANALYSIS/vsearch.qza"
+TAX1="$ANALYSIS/taxonomy_vsearch.qza"
+qiime feature-classifier classify-consensus-vsearch \
   --i-query "$REP_QZA" \
-  --i-blastdb "$BLASTDB" \
+  --i-reference-reads "$BLASTDB" \
   --i-reference-taxonomy "$TAX_DEREP" \
   --p-perc-identity 0.85 --p-maxaccepts 1 --p-query-cov 0.85 \
-  --p-num-threads "$THREADS_BLAST" \
+  --p-threads "$THREADS_BLAST" \
   --o-search-results "$SEARCH1" \
   --o-classification "$TAX1"
 
@@ -90,25 +90,25 @@ qiime feature-table filter-seqs \
   --o-filtered-data "$FILT_REP"
 
 # ---- BLAST 분류 최종 ----
-SEARCH2="$ANALYSIS/blast_results_2.qza"
-TAX_FINAL="$ANALYSIS/final_taxonomy_blast.qza"
-qiime feature-classifier classify-consensus-blast \
+SEARCH2="$ANALYSIS/vsearch_result.qza"
+TAX_FINAL="$ANALYSIS/final_taxonomy_vsearch.qza"
+qiime feature-classifier classify-consensus-vsearch \
   --i-query "$FILT_REP" \
-  --i-blastdb "$BLASTDB" \
+  --i-reference-reads "$BLASTDB" \
   --i-reference-taxonomy "$TAX_DEREP" \
   --p-perc-identity 0.85 --p-maxaccepts 1 --p-query-cov 0.85 \
-  --p-num-threads "$THREADS_BLAST" \
+  --p-threads "$THREADS_BLAST" \
   --o-search-results "$SEARCH2" \
   --o-classification "$TAX_FINAL"
 
 # ---- 결과 Export ----
-FINAL_DIR="$ANALYSIS/final_taxonomy_blast"; mkdir -p "$FINAL_DIR"
-qiime metadata tabulate --m-input-file "$TAX_FINAL" --o-visualization "$FINAL_DIR/final_taxonomy_blast.qzv"
-qiime tools export --input-path "$FINAL_DIR/final_taxonomy_blast.qzv" --output-path "$FINAL_DIR"
+FINAL_DIR="$ANALYSIS/final_taxonomy_vsearch"; mkdir -p "$FINAL_DIR"
+qiime metadata tabulate --m-input-file "$TAX_FINAL" --o-visualization "$FINAL_DIR/final_taxonomy_vsearch.qzv"
+qiime tools export --input-path "$FINAL_DIR/final_taxonomy_vsearch.qzv" --output-path "$FINAL_DIR"
 
-BR2_DIR="$ANALYSIS/blast_results_2"; mkdir -p "$BR2_DIR"
-qiime metadata tabulate --m-input-file "$SEARCH2" --o-visualization "$BR2_DIR/blast_results_2.qzv"
-qiime tools export --input-path "$BR2_DIR/blast_results_2.qzv" --output-path "$BR2_DIR"
+BR2_DIR="$ANALYSIS/vsearch_results_2"; mkdir -p "$BR2_DIR"
+qiime metadata tabulate --m-input-file "$SEARCH2" --o-visualization "$BR2_DIR/vsearch_results_2.qzv"
+qiime tools export --input-path "$BR2_DIR/vsearch_results_2.qzv" --output-path "$BR2_DIR"
 
 ASV_DIR="$ANALYSIS/ASV_quantified";  mkdir -p "$ASV_DIR"
 qiime tools export --input-path "$FILT_TABLE" --output-path "$ASV_DIR"

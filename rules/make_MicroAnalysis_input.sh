@@ -2,15 +2,15 @@
 # POSIX /bin/sh 호환: manifest 1열만 사용해서 metadata 만들기(+ feature/taxonomy 변환)
 set -eu
 
-ANALYSIS="${ANALYSIS:-../GutBiomeTech/blast_results}"
+ANALYSIS="${ANALYSIS:-../GutBiomeTech/vsearch_results}"
 MA_DIR="${MA_DIR:-../GutBiomeTech/MicrobiomeAnalyst}"
 UP="$MA_DIR/upload"
 mkdir -p "$UP"
 
 FT="$ANALYSIS/ASV_quantified/feature-table.txt"
 MAN="$ANALYSIS/sample_manifest.txt"
-TAX1="$ANALYSIS/final_taxonomy_blast/taxonomy.tsv"
-TAX2="$ANALYSIS/final_taxonomy_blast/metadata.tsv"
+TAX1="$ANALYSIS/final_taxonomy_vsearch/taxonomy.tsv"
+TAX2="$ANALYSIS/final_taxonomy_vsearch/metadata.tsv"
 
 [ -s "$FT" ]  || { echo "ERROR: feature-table 없음: $FT"  >&2; exit 1; }
 [ -s "$MAN" ] || { echo "ERROR: sample_manifest 없음: $MAN" >&2; exit 1; }
