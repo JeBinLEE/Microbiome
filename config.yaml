@@ -1,0 +1,40 @@
+ref_dir: "NCBI-RefSeq-16s-202505"
+analysis_dir: "GutBiomeTech/vsearch_results"
+
+fastq_dir: "/home/ljb/qiime2_analysis/GutBiomeTech/M17_fastq"
+suffix_r1: "_L001_R1_001.fastq.gz"
+suffix_r2: "_L001_R2_001.fastq.gz"
+
+threads_cutadapt: 24
+threads_blast: 48
+threads_picrust2: 40
+
+ma_dir: "GutBiomeTech/MicrobiomeAnalyst"
+ma_outdir: "GutBiomeTech/MicrobiomeAnalyst/results_R_test_MA2"
+ma_group: "Group1"
+rarefy_q: 0.00
+p_cut: 0.1
+count_cut: 4
+
+lefse_outdir: "GutBiomeTech/MicrobiomeAnalyst/results_R_test_MA2/04_LEfse"
+
+picrust_dir: "GutBiomeTech/vsearch_results/picrust2"
+picrust_export_dir: "GutBiomeTech/vsearch_results/picrust2/picrust2_data"
+picrust_topn: 5
+
+rscript_bin: "/usr/bin/Rscript"
+report_dir: "report"
+
+script_build_db: "rules/2_NCBI_build_db.sh"
+script_make_manifest: "rules/make_manifest.sh"
+script_qiime2_analyze: "rules/3_analyze.sh"
+script_make_ma_input: "rules/make_MicroAnalysis_input.sh"
+script_ma_pipeline_r: "scripts/microbiomeanalyst_pipeline.R"
+script_lefse_r: "scripts/run_ma_lefse.R"
+script_picrust_qc_export: "scripts/picrust2_qc_and_export.sh"
+script_picrust_plot_r: "scripts/plot_kegg_by_class.R"
+script_build_report: "scripts/build_html_report.py"
+
+qiime2_env_yaml: "envs/qiime2-amplicon-ubuntu-latest-conda.yml"
+picrust2_env_yaml: "envs/picrust2.yml"
+
