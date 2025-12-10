@@ -1,5 +1,4 @@
 #!/usr/bin/env Rscript
-.libPaths("/home/ljb/R/x86_64-pc-linux-gnu-library/4.4")
 suppressPackageStartupMessages({
   library(optparse)
   library(MicrobiomeAnalystR)
@@ -7,33 +6,48 @@ suppressPackageStartupMessages({
   library(dplyr)
   library(ggplot2)
   library(readr)
+  library(rlang)
 })
 
-# -------------------------------
-# CLI 옵션 (필수 4개만)
-# -------------------------------
+## -------------------------------
+## CLI 옵션
+## -------------------------------
 option_list <- list(
-  make_option("--feat_fp", type="character", help="feature_table_for_MA.txt"),
-  make_option("--tax_fp",  type="character", help="taxonomy_for_MA.txt"),
-  make_option("--meta_fp", type="character", help="metadata_for_MA.txt"),
-  make_option("--outdir",  type="character", help="Output directory")
+  make_option("--feat_fp",  type="character", help="feature_table_for_MA.txt"),
+  make_option("--tax_fp",   type="character", help="taxonomy_for_MA.txt"),
+  make_option("--meta_fp",  type="character", help="metadata_for_MA.txt"),
+  make_option("--outdir",   type="character", help="Output directory"),
+  make_option("--group",    type="character", default="Group1"),
+  make_option("--p_cut",    type="double",    default=0.10),
+  make_option("--count_cut",type="double",    default=4),
+  make_option("--rarefy_q", type="double",    default=0.00,
+              help="0.00=min depth; (0,1]=quantile for rarefaction depth (default: %default)")
 )
 opt <- parse_args(OptionParser(option_list = option_list))
-if (any(vapply(list(opt$feat_fp, opt$tax_fp, opt$meta_fp, opt$outdir), is.null, TRUE))) {
-  stop("Missing required args. Usage: run_ma_lefse.R --feat_fp ... --tax_fp ... --meta_fp ... --outdir ...")
+req <- c("feat_fp","tax_fp","meta_fp","outdir")
+if (any(vapply(opt[req], is.null, TRUE))) {
+  stop("Missing required args. Use: --feat_fp --tax_fp --meta_fp --outdir [--group] [--rarefy_q]")
 }
 
-# 절대경로 고정 (setwd 전)
-feat_fp <- normalizePath(opt$feat_fp, mustWork = TRUE)
-tax_fp  <- normalizePath(opt$tax_fp,  mustWork = TRUE)
-meta_fp <- normalizePath(opt$meta_fp, mustWork = TRUE)
-outdir  <- normalizePath(opt$outdir,  mustWork = FALSE)
+## 절대경로
+feat_fp   <- normalizePath(opt$feat_fp, mustWork=TRUE)
+tax_fp    <- normalizePath(opt$tax_fp,  mustWork=TRUE)
+meta_fp   <- normalizePath(opt$meta_fp, mustWork=TRUE)
+outdir    <- normalizePath(opt$outdir,  mustWork=FALSE)
+group_col <- opt$group
+rarefy_q  <- opt$rarefy_q
+p_cut     <- opt$p_cut
+count_cut <- opt$count_cut
 
-dir.create(outdir, showWarnings = FALSE, recursive = TRUE)
+dir.create(outdir, showWarnings=FALSE, recursive=TRUE)
 setwd(outdir)
 
 message("== MicrobiomeAnalystR end-to-end + pairwise LEfSe (Genus) ==")
 message("Output dir: ", outdir)
+message("Group column: ", group_col, " | rarefy_q: ", rarefy_q)
+
+## 유틸: 파일명 안전 토큰
+safe_token <- function(x) gsub("[^A-Za-z0-9]+","_", x)
 
 # -------------------------------
 # condenseOTUs 자동 탐색/로드 (없으면 shim)
@@ -103,7 +117,7 @@ mbSet <- CreatePhyloseqObj(mbSet, "text", "QIIME", "F", "false")
 # -------------------------------
 # 2) 전체 필터 → 정규화
 # -------------------------------
-mbSet <- ApplyAbundanceFilter(mbSet, "prevalence", 4, 0.20)
+mbSet <- ApplyAbundanceFilter(mbSet, "prevalence", 4, 0.10)
 mbSet <- ApplyVarianceFilter(mbSet, "iqr", 0.10)
 
 libsizes  <- phyloseq::sample_sums(mbSet$dataSet$proc.phyobj)
@@ -114,13 +128,29 @@ mbSet <- PerformNormalization(
   "colsum",                # scale.method
   "none",                  # trans.method
   "true",                  # rarefy
-  as.integer(min_depth)    # rarefy.depth
+  30000                    # rarefy.depth (고정값)
 )
 
 # -------------------------------
 # 3) LEfSe (전체 그룹) - Genus
 # -------------------------------
 mbSet <- PerformLefseAnal(mbSet, 0.10, "fdr", 2.0, "Group1", "F", "NA", "Genus")
+
+## ✅ 전체 결과 CSV 저장
+rt_all <- mbSet$analSet$lefse$resTable
+if (!is.null(rt_all) && NROW(rt_all) > 0) {
+  # LDA 숫자 보정
+  if ("lda" %in% names(rt_all) && !is.numeric(rt_all$lda)) {
+    lda_num <- suppressWarnings(as.numeric(as.character(rt_all$lda)))
+    if (any(is.finite(lda_num))) rt_all$lda <- lda_num
+  }
+  readr::write_csv(rt_all, "lefse_de_output.csv")
+} else {
+  # 결과가 없으면 빈 CSV라도 생성(파이프라인 호환성용)
+  readr::write_csv(tibble::tibble(), "lefse_de_output.csv")
+}
+
+## 그림 저장
 mbSet <- PlotLEfSeSummary(mbSet, 30, "dot", "lefse_dot_genus", "png")
 mbSet <- PlotLEfSeSummary(mbSet, 30, "bar", "lefse_bar_genus", "png")
 
@@ -137,7 +167,8 @@ for (pp in pairs) {
   mbSet_filter <- mbSet
   g1 <- pp[1]
   g2 <- pp[2]
-  print(paste0(g1,"vs", g2))
+  comp_id <- paste0(safe_token(g1), "vs", safe_token(g2))
+  message("== Pairwise: ", g1, " vs ", g2, " ==")
   
   # smpl.nm.vec 전역 주입 (UpdateSampleItems가 전역을 읽음)
   smpl.nm.vec <- meta %>% dplyr::filter(Group1 %in% c(g1,g2)) %>% dplyr::pull(Sample)
@@ -154,7 +185,7 @@ for (pp in pairs) {
   }
   
   # 필터; 실패해도 계속 진행
-  mbSet_filter <- tryCatch(ApplyAbundanceFilter(mbSet_filter, "prevalence", 4, 0.20),
+  mbSet_filter <- tryCatch(ApplyAbundanceFilter(mbSet_filter, "prevalence", 4, 0.10),
                            error = function(e) { message("[warn] ApplyAbundanceFilter: ", e$message); return(mbSet_filter) })
   mbSet_filter <- tryCatch(ApplyVarianceFilter(mbSet_filter, "iqr", 0.10),
                            error = function(e) { message("[warn] ApplyVarianceFilter: ", e$message); return(mbSet_filter) })
@@ -169,7 +200,7 @@ for (pp in pairs) {
     PerformNormalization(
       mbSet_filter,
       "none", "colsum", "none",
-      "true", as.integer(min_depth)
+      "true", 30000
     ),
     error = function(e) { message("[skip] PerformNormalization: ", e$message); return(NULL) }
   )
@@ -186,13 +217,18 @@ for (pp in pairs) {
   rt <- mbSet_filter$analSet$lefse$resTable
   if (is.null(rt) || NROW(rt) == 0) { message("[skip] empty LEfSe result: ", g1, "vs", g2); next }
   
-  # LDA 숫자 아닌 경우 유효값 없으면 패스
+  # LDA 숫자 아닌 경우 유효값만 반영
   if ("lda" %in% names(rt) && !is.numeric(rt$lda)) {
     lda_num <- suppressWarnings(as.numeric(as.character(rt$lda)))
     keep <- is.finite(lda_num) & !is.na(lda_num)
     if (!any(keep)) { message("[skip] non-finite LDA: ", g1, "vs", g2); next }
     mbSet_filter$analSet$lefse$resTable$lda <- lda_num
+    rt <- mbSet_filter$analSet$lefse$resTable
   }
+  
+  ## ✅ 페어별 CSV 저장
+  csv_name <- paste0("lefse_", comp_id, ".csv")
+  readr::write_csv(rt, csv_name)
   
   # 플롯; 실패해도 건너뜀
   mbSet_filter <- tryCatch(

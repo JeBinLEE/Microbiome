@@ -1,5 +1,4 @@
 #!/usr/bin/env Rscript
-.libPaths("/home/ljb/R/x86_64-pc-linux-gnu-library/4.4")
 
 suppressPackageStartupMessages({
   library(optparse)
@@ -24,6 +23,7 @@ opt_list <- list(
   make_option("--rank",     type="character", default="Genus"),
   make_option("--lda_cut",  type="double",    default=2.0),
   make_option("--p_cut",    type="double",    default=0.10),
+  make_option("--count_cut",    type="double",    default=4),
   make_option("--rarefy_q", type="double",    default=0.00)
 )
 opt <- parse_args(OptionParser(option_list=opt_list))
@@ -37,6 +37,7 @@ grp     <- opt$group
 rank_use<- opt$rank
 lda_cut <- opt$lda_cut
 p_cut   <- opt$p_cut
+count_cut   <- opt$count_cut
 rq      <- opt$rarefy_q
 
 dir.create(outdir, showWarnings = FALSE, recursive = TRUE)
@@ -56,14 +57,14 @@ dir_qc <- mkdir("00_QC_Normalization")
 with_dir(dir_qc, { try(PlotLibSizeView(mbSet, "norm_libsizes_before", "png"), silent=TRUE) })
 
 mbSet <- CreatePhyloseqObj(mbSet, "text", "QIIME", "F", "false")
-mbSet <- ApplyAbundanceFilter(mbSet, "prevalence", 4, 0.20)
+mbSet <- ApplyAbundanceFilter(mbSet, "prevalence", count_cut, p_cut) # change to input parameter
 mbSet <- ApplyVarianceFilter(mbSet, "iqr", 0.10)
 
 libsizes <- phyloseq::sample_sums(mbSet$dataSet$proc.phyobj)
 if (length(libsizes) == 0) stop("No samples detected after filtering.")
 min_depth <- if (rq > 0 && rq < 1) floor(quantile(libsizes, rq)) else min(libsizes)
 
-mbSet <- PerformNormalization(mbSet, "none", "colsum", "none", "true", as.integer(min_depth))
+mbSet <- PerformNormalization(mbSet, "none", "colsum", "none", "true", 30000) # change to input parameter
 with_dir(dir_qc, { try(PlotLibSizeView(mbSet, "norm_libsizes_after", "png"), silent=TRUE) })
 
 ## ===== common ps/meta =====
@@ -196,7 +197,7 @@ dir_comp <- mkdir("03_Composition")
 
 # ---- A) 기존 Phylum/Genus barplot (샘플×그룹 facet) ----
 with_dir(dir_comp, {
-  ranks_to_plot <- c("Phylum", "Genus")
+  ranks_to_plot <- c("Phylum","Class","Order","Family","Genus","Species")
   for (rk in ranks_to_plot) {
     if (!(rk %in% colnames(tax_table(ps)))) next
     ps_rk  <- suppressWarnings(tax_glom(ps, taxrank = rk, NArm = TRUE))
@@ -231,43 +232,134 @@ with_dir(dir_comp, {
     ggsave(sprintf("barplot_%s.png", tolower(rk)), p, width = 14, height = 6, dpi = 200)
   }
 })
+# 
+# # ---- B) MicrobiomeAnalystR: 모든 rank에 대해 PlotTaxaAbundanceBarSamGrp ----
+# dir_comp_samgrp <- file.path(dir_comp, "SamGrpBars")
+# dir.create(dir_comp_samgrp, showWarnings = FALSE, recursive = TRUE)
+# 
+# with_dir(dir_comp_samgrp, {
+#   ranks_all <- c("Kingdom","Phylum","Class","Order","Family","Genus","Species")
+#   
+#   run_safely <- function(expr) {
+#     tryCatch(force(expr),
+#              error = function(e){ message("Skip: ", conditionMessage(e)); invisible(NULL) })
+#   }
+#   
+#   for (rk in ranks_all) {
+#     if (!(rk %in% colnames(tax_table(ps)))) {
+#       message("Skip SamGrp bar (rank missing): ", rk); next
+#     }
+#     img_base <- sprintf("taxa_bar_samgrp_%s", tolower(rk))
+#     message(">> PlotTaxaAbundanceBarSamGrp: ", rk)
+#     run_safely({
+#       # (imgName, taxRank, colorFac, facetFac, type, topNum, palette, sumMethod, featNum, legendPos, showOther, fmt)
+#       mbSet <<- PlotTaxaAbundanceBarSamGrp(
+#         mbSet,
+#         img_base,
+#         rk,
+#         grp,     # color
+#         grp,     # facet
+#         "barnorm",
+#         10,
+#         "set3",
+#         "sum",
+#         10,
+#         "bottom",
+#         "F",
+#         "png"
+#       )
+#     })
+#   }
+# })
 
-# ---- B) MicrobiomeAnalystR: 모든 rank에 대해 PlotTaxaAbundanceBarSamGrp ----
+
+# ---- B) SamGrpBars를 ggplot으로 직접 생성 (샘플×그룹 & 그룹평균) ----
 dir_comp_samgrp <- file.path(dir_comp, "SamGrpBars")
 dir.create(dir_comp_samgrp, showWarnings = FALSE, recursive = TRUE)
 
-with_dir(dir_comp_samgrp, {
-  ranks_all <- c("Kingdom","Phylum","Class","Order","Family","Genus","Species")
-  
-  run_safely <- function(expr) {
-    tryCatch(force(expr),
-             error = function(e){ message("Skip: ", conditionMessage(e)); invisible(NULL) })
+.clean_taxon <- function(x, rk) {
+  x <- as.character(x)
+  x[is.na(x) | x == "" | x == "NA"] <- paste0("Unclassified_", rk)
+  x
+}
+
+make_samgrp_plots_one_rank <- function(ps, rk, grp, outdir, topN = 10) {
+  if (!(rk %in% colnames(tax_table(ps)))) {
+    message("Skip SamGrpBars (rank missing): ", rk)
+    return(invisible(NULL))
   }
   
+  # rank로 집계 후 sample별 상대풍부도
+  ps_rk  <- suppressWarnings(tax_glom(ps, taxrank = rk, NArm = TRUE))
+  ps_rel <- transform_sample_counts(ps_rk, function(x) if (sum(x) == 0) x else x / sum(x))
+  
+  df <- psmelt(ps_rel) |>
+    dplyr::select(Sample, all_of(grp), OTU, Abundance, all_of(rk)) |>
+    dplyr::rename(Group = !!sym(grp), Taxon = !!sym(rk)) |>
+    dplyr::mutate(Taxon = .clean_taxon(Taxon, rk))
+  
+  # 상위 topN taxon만 표기, 나머지 Others
+  top_taxa <- df |>
+    dplyr::group_by(Taxon) |>
+    dplyr::summarise(total = sum(Abundance), .groups = "drop") |>
+    dplyr::arrange(dplyr::desc(total)) |>
+    dplyr::slice_head(n = topN) |>
+    dplyr::pull(Taxon)
+  
+  df <- df |>
+    dplyr::mutate(Taxon2 = ifelse(Taxon %in% top_taxa, Taxon, "Others"))
+  
+  # (1) 샘플별 스택바: x=Sample, facet=Group  → SamGrpBars_sample
+  df_samp <- df |>
+    dplyr::group_by(Sample, Group, Taxon2) |>
+    dplyr::summarise(Abundance = sum(Abundance), .groups = "drop")
+  
+  # 그룹 내 샘플 순서를 Group별로 묶어서 정렬
+  sample_order <- df_samp |>
+    dplyr::group_by(Group, Sample) |>
+    dplyr::summarise(tot = sum(Abundance), .groups = "drop") |>
+    dplyr::arrange(Group, dplyr::desc(tot)) |>
+    dplyr::pull(Sample)
+  
+  df_samp$Sample <- factor(df_samp$Sample, levels = unique(sample_order))
+  
+  p_samp <- ggplot(df_samp, aes(x = Sample, y = Abundance, fill = Taxon2)) +
+    geom_col(width = 0.95) +
+    facet_grid(~ Group, scales = "free_x", space = "free_x") +
+    theme_bw(12) +
+    theme(axis.text.x = element_text(angle = 90, vjust = .5, hjust = 1)) +
+    labs(title = sprintf("Taxonomic composition (Sample × Group) • %s", rk),
+         x = "Sample", y = "Relative abundance")
+  
+  fn1 <- file.path(outdir, sprintf("taxa_bar_SamGrpBars_sample_%s.png", tolower(rk)))
+  ggsave(fn1, p_samp, width = 14, height = 6, dpi = 200)
+  ggsave(sub("\\.png$", ".pdf", fn1), p_samp, width = 14, height = 6)
+  
+  # (2) 그룹평균 스택바: x=Group, y=mean(rel)  → SamGrpBars_groupmean
+  df_group <- df |>
+    dplyr::group_by(Group, Taxon2, Sample) |>
+    dplyr::summarise(Abundance = sum(Abundance), .groups = "drop") |>
+    dplyr::group_by(Group, Taxon2) |>
+    dplyr::summarise(mean_rel = mean(Abundance, na.rm = TRUE), .groups = "drop")
+  
+  p_grp <- ggplot(df_group, aes(x = Group, y = mean_rel, fill = Taxon2)) +
+    geom_col(width = 0.9) +
+    theme_bw(12) +
+    labs(title = sprintf("Taxonomic composition (Group mean) • %s", rk),
+         x = "Group", y = "Mean relative abundance")
+  
+  fn2 <- file.path(outdir, sprintf("taxa_bar_SamGrpBars_groupmean_%s.png", tolower(rk)))
+  ggsave(fn2, p_grp, width = 9, height = 5, dpi = 200)
+  ggsave(sub("\\.png$", ".pdf", fn2), p_grp, width = 9, height = 5)
+  
+  invisible(list(sample_plot = fn1, group_plot = fn2))
+}
+
+withr::with_dir(dir_comp_samgrp, {
+  ranks_all <- c("Kingdom","Phylum","Class","Order","Family","Genus","Species")
   for (rk in ranks_all) {
-    if (!(rk %in% colnames(tax_table(ps)))) {
-      message("Skip SamGrp bar (rank missing): ", rk); next
-    }
-    img_base <- sprintf("taxa_bar_samgrp_%s", tolower(rk))
-    message(">> PlotTaxaAbundanceBarSamGrp: ", rk)
-    run_safely({
-      # (imgName, taxRank, colorFac, facetFac, type, topNum, palette, sumMethod, featNum, legendPos, showOther, fmt)
-      mbSet <<- PlotTaxaAbundanceBarSamGrp(
-        mbSet,
-        img_base,
-        rk,
-        grp,     # color
-        grp,     # facet
-        "barnorm",
-        10,
-        "set3",
-        "sum",
-        10,
-        "bottom",
-        "F",
-        "png"
-      )
-    })
+    message(">> SamGrpBars ggplot: ", rk)
+    try(make_samgrp_plots_one_rank(ps, rk, grp, getwd(), topN = 10), silent = TRUE)
   }
 })
 
