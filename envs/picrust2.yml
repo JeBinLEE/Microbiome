@@ -1,0 +1,15 @@
+# ~/qiime2_analysis/envs/picrust2.yml
+name: picrust2-253
+channels:
+  - bioconda
+  - conda-forge
+  - defaults
+dependencies:
+  - python=3.9
+  - picrust2=2.5.3
+  - biom-format
+  - numpy
+  - pandas
+  - scipy
+  - h5py
+
