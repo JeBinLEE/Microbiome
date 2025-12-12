@@ -44,6 +44,8 @@ install.packages("Tax4Fun_0.3.1.tar.gz",
 ```
 
 ### Note: Installing MicrobiomeAnalystR
+copy MicrobiomeAnalystR folder to your R library
+
 https://github.com/xia-lab/MicrobiomeAnalystR/issues/35
 ---
 
@@ -62,15 +64,6 @@ conda env create -f envs/environment.yml
 
 ```bash
 conda activate <ENV_NAME>
-
-```
-## 1-2) Installing MicrobiomeAnalystR (R)
-
-MicrobiomeAnalystR depends on several R/Bioconductor packages; R and Bioconductor version compatibility matters. The project and the following issue contain useful installation guidance:
-
-Project: https://github.com/xia-lab/MicrobiomeAnalystR
-
-Issue discussion (worth reading): https://github.com/xia-lab/MicrobiomeAnalystR/issues/35
 
 ## Environment Variables
 You can override these before running Snakemake:
