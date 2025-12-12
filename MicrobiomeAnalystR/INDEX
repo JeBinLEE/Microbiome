@@ -1,0 +1,198 @@
+.read.microbiomeanalyst.lib.rds
+                        Read RDS files from the internet
+.readDataTable          Read data table
+AddErrMsg               Adds an error message
+ApplyAbundanceFilter    Function to filter uploaded data
+ApplyAbundanceFilterMeta
+                        Function to filter uploaded data in
+                        meta-analysis module
+ApplyMetaboFilter       Function to filter uploaded metabolomic data
+ApplyVarianceFilter     Function to filter uploaded data
+ApplyVarianceFilterMeta
+                        Function to filter uploaded data
+CalculateHyperScore     Calculate enrichment score.
+CheckMetaDataIntegrity
+                        Check if data are ready for meta-analysis
+CleanData               Perform data cleaning
+CompareSummaryStats     Perform alpha diversity meta-analysis
+CoreMicrobeAnalysis     Perform core microbiome analysis
+CreateFooter            Create report of analyses (Met Enrichment)
+CreateMDPRnwReport      Function to create PDF report for MDP module
+CreatePhyloseqObj       Function to recreate phyloseq object
+CreatePhyloseqObjMeta   Function to recreate phyloseq object in
+                        meta-analysis module
+CreateRHistAppendix     Create report of analyses
+CreateSDPRnwReport      Function to create PDF report for SDP module
+CrossReferencing        Perform cross referencing.
+FeatureCorrelation      Main function to calculate correlation of all
+                        other feature to a given feature name
+GenerateTemplates       Function to generate templates
+GetColorSchema          Function to get color palette for graphics.
+GetDataForPie           Utility function to exract data for piechart.
+GetErrMsg               Gets the error message
+GetFinalNameMap         Getter to return final map
+GetGeneListStat         Function to get gene list statistics
+GetMapTable             Getter function
+GetORATable             Getter function
+GetRFConf.Table         Getter function
+GetSigTable.Corr        Getter function
+GetSigTable.LEFSE       Getter function
+GetSigTable.METAGENOSEQ
+                        Getter function
+GetSigTable.RNASeq      Getter function
+GetSigTable.UNIVAR      Getter function
+Init.DataMeta           Init resources & global settings & variables.
+Init.mbSetObj           Constructs a mbSet object for storing data
+Match.Pattern           Match Patterns Function
+MergeDatasets           Merge two or more datasets into merged phyloseq
+                        object
+PCoA3D.Anal             Main function to perform PCoA analysis
+PCoA3DAnal.16SRef       Function to create PCoA
+Perform16FunAnot_mem    Main function to perform 16S functional
+                        annotation
+PerformAlphaDiversityComp
+                        Perform alpha diversity
+PerformBatchCorrection
+                        Perform batch correction of meta-analysis
+                        datasets
+PerformBetaDiversity    Function to plot beta diversity.
+PerformCategoryComp     Function to perform categorical comparison.
+PerformDEAnalyse        Perform differential analysis
+PerformKOEnrichAnalysis_KO01100
+                        Function to prepare KO enrichment analysis.
+PerformKOProjection     Function to perform KO projection
+PerformKOmapping        Function to perform KO mapping.
+PerformLefseAnal        Main function to perform LEfSe analysis
+PerformMetaEffectSize   Perform differential abundance analysis on
+                        individual dataset and apply combine effect
+                        size meta-analysis method on the results
+PerformMetaboNormalization
+                        Function to perform normalization on
+                        metabolomics data
+PerformMetagenomeSeqAnal
+                        Main function to perform metagenome seq
+                        analysis
+PerformNetworkCorrelation
+                        Function to call for correlation network
+PerformNormalization    Function to perform normalization
+PerformNormalizationMeta
+                        Function to perform normalization
+PerformPartialCorr      Perform Partial Correlation Analysis
+PerformRNAseqDE         Main function to perform RNAseq analysis
+PerformRarefaction      Utility function to perform rarefraction (used
+                        by PerformNormalization)
+PerformRefDataMapping   Function to perform reference data mapping.
+PerformUnivarTest       Main function to perform classical univariate
+                        analysis.
+PlotAlphaBoxData        Function to create box plots for alpha
+                        diversity analysis
+PlotAlphaData           Function to plot alpha-diversity analysis.
+PlotBetaSummary         Perform beta diversity meta-analysis
+PlotBoxData             Function to create box plots of important
+                        features
+PlotBoxDataCorr         Function to create box plots of important
+                        features
+PlotCorr                Plot Pattern Search
+PlotDataPieFromPie      Function to plot pie-chart data.
+PlotEnrichNet.Overview
+                        Create network for enrichmnet overview
+PlotFunAnotSummary      Plot functional annotation summary
+PlotFunctionStack       Function to plot stacked bar chart of
+                        functional data.
+PlotGroupPieGraph       Main function to plot pie graphs of microbiome
+                        data.
+PlotHeatmap             Main function to plot heatmap.
+PlotImpVar              Helper function to plot variable importance
+                        (for RF and LEfSe)
+PlotImpVarLEfSe         Plot LEfSe summary
+PlotLEfSeSummary        Plot LEfSe summary
+PlotLibSizeView         Function to plot library size
+PlotMetaDensity         Plot density plot of datasets in meta-analysis
+                        module
+PlotMetaPCA             Plot PCA plot for meta-analysis samples
+PlotOverallPieGraph     Main function to plot pie graphs of microbiome
+                        data.
+PlotPCAView             Plot PCA plot for multi-omics samples
+PlotPhylogeneticTree    Function to prepare data for phylogenetic tree.
+PlotPiechart            Function to create pie-chart plot.
+PlotRF.Classify         Plot Random Forest Classification
+PlotRF.VIP              Plot variable importance ranked by
+                        MeanDecreaseAccuracy
+PlotRareCurve           Function to plot rarefraction curves
+PlotRarefactionCurve    Function to create rarefraction curves of
+                        microbiome data
+PlotSamplePieGraph      Main function to plot sample-wise pie graphs of
+                        microbiome data.
+PlotSampleTaxaAundanceBar
+                        Function to create bar plots of selected taxa
+                        level.
+PlotSelectedSample      Function to create a summary of a sample using
+                        a piechart at different tax level.
+PlotTaxaAbundanceArea   Plot functional annotation summary
+PlotTaxaAbundanceBarSamGrp
+                        Function to plot group-wise bar charts.
+PlotTaxaAundanceBar     Function to plot bar charts for alpha diversity
+PlotTreeGraph           Function to plot tree graphics for dendogram.
+PlotUsrRefPCoA3DScore   Function to plot 3D score plot.
+PrepareEnrichNet        Function to prepare data for enrichment
+                        network.
+PrepareHeatTreePlot     Function to plot heat tree
+PrepareHeatTreePlotDataParse_cmf
+                        Function to prepare heat tree data
+PrepareHeatTreePlotDataParse_cmf_diff_table
+                        Function to prepare heat tree data
+PrepareHeatTreePlotDataParse_cmf_plot
+                        Function to prepare heat tree data
+PrepareMergedData       Function to merge user data with public data.
+PreparePCA4Shotgun      Function to prepare shotgun data for PCA.
+PreparePDFReport        Function to create PDF report
+PrepareQueryJson        Function to prepare query for JSON.
+RF.Anal                 Performs Random Forest Analysis
+Read16SAbundData        Main function to read 16S data
+Read16SAbundDataMeta    Function to read 16S Abundance data in
+                        meta-analysis module
+Read16SBiomData         Function to read 16S data in biom format
+Read16STabData          Function to read 16S data
+Read16STaxaTable        Function to read 16S taxonomy table from txt
+                        format
+Read16STaxaTableMeta    Function to read 16S taxonomy table from txt
+                        format in meta-analysis module
+ReadMetabolicTable      Main function to read metabolomics table
+ReadMothurData          Function to read 16S data in mothur format
+ReadSampleTable         Function to read in sample data
+ReadSampleTableMeta     Function to read in sample data in
+                        meta-analysis module (merged metadata file)
+ReadSampleTableMetaInd
+                        Function to read in sample data in
+                        meta-analysis module
+ReadShotgunBiomData     Main function to read in shotgun data
+ReadShotgunTabData      Main function to read in shotgun data
+ReadTreeFile            Function to read in tree files.
+RunFastSpar             Function to call FastSpar
+SanityCheckData         Main function to sanity check on uploaded
+                        microbiome data
+SanityCheckDataMeta     Individual sanity check on selected datase in
+                        meta-analysis module
+SanityCheckMetData      Function to sanity check on uploaded
+                        metabolomics data
+SanityCheckSampleData   SanityCheckSampleData
+SanityCheckSampleDataMeta
+                        SanityCheckSampleData
+SavePiechartImg         Function to save pie-chart
+SetDataTypeOfMeta       SetDataTypeOfMeta
+SetMetaAttributes       SetMetaAttributes'
+SetModuleType           Function to set analysis type
+SetTaxonSetLib          Set the microbe set library
+Setup.MapData           Function to set up data for TSEA
+UpdateConfItems         Function to update confounders used for partial
+                        correlation
+UpdateListInput         Function to filter list data based on a minimum
+                        count
+UpdatePieData           Function to update pie-chart data.
+UpdateSampleItems       Function to update samples
+case_when               https://github.com/s-fleck/lest/tree/master/R
+condenseOTUs            Helper Function that will take the OTU Table
+                        (as a data.frame()) to which column
+                        representing taxa has been added.  There is
+                        some munging to handle rownames and the tax
+                        column but the basic idea is there.
