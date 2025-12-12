@@ -42,6 +42,9 @@ install.packages("Tax4Fun_0.3.1.tar.gz",
                  repos = NULL,
                  type  = "source")
 ```
+
+### Note: Installing MicrobiomeAnalystR
+https://github.com/xia-lab/MicrobiomeAnalystR/issues/35
 ---
 
 ## 1) Install via Conda/Mamba
