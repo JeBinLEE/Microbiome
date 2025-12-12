@@ -1,0 +1,469 @@
+###############################################
+# Snakefile (config-driven, end-to-end report)
+###############################################
+
+# 사용할 설정 파일 (원하면 이름 바꿔도 됨)
+configfile: "config.yaml"
+
+# -----------------------------
+# 0) Config with safe defaults
+# -----------------------------
+REF_DIR          = config.get("ref_dir", "NCBI-RefSeq-16s-202505")
+
+ANALYSIS         = config.get("analysis_dir", "GutBiomeTech/vsearch_results")
+
+FASTQ_DIR        = config.get("fastq_dir", "/home/ljb/qiime2_analysis/GutBiomeTech/M17_fastq")
+SUFFIX_R1        = config.get("suffix_r1", "_L001_R1_001.fastq.gz")
+SUFFIX_R2        = config.get("suffix_r2", "_L001_R2_001.fastq.gz")
+
+THREADS_CUTADAPT = str(config.get("threads_cutadapt", 24))
+THREADS_BLAST    = str(config.get("threads_blast", 48))
+
+MA_DIR        = config.get("ma_dir", "GutBiomeTech/MicrobiomeAnalyst")
+MA_UPLOAD_DIR = f"{MA_DIR}/upload"
+MA_OUTDIR     = config.get("ma_outdir", f"{MA_DIR}/results_R_test_MA2")
+MA_GROUP      = config.get("ma_group", "Group1")
+RAREFY_Q      = str(config.get("rarefy_q", 0.00))
+
+LEFSE_OUTDIR  = config.get("lefse_outdir", f"{MA_OUTDIR}/04_LEfse")
+
+PICRU         = config.get("picrust_dir", f"{ANALYSIS}/picrust2")
+TGT           = config.get("picrust_export_dir", f"{PICRU}/picrust2_data")
+
+RS_BIN        = config.get("rscript_bin", "/usr/bin/Rscript")
+
+REPORT_DIR    = config.get("report_dir", "report")
+
+# 내부 센티널
+MANIFEST      = f"{ANALYSIS}/sample_manifest.txt"
+ANALYZE_DONE  = ".done/_3_analyze_sh.done"
+
+# 스크립트 / 환경
+SCRIPT_BUILD_DB             = config.get("script_build_db", "rules/2_NCBI_build_db.sh")
+SCRIPT_MAKE_MANIFEST        = config.get("script_make_manifest", "rules/make_manifest.sh")
+SCRIPT_QIIME2_ANALYZE       = config.get("script_qiime2_analyze", "rules/3_analyze.sh")
+SCRIPT_MA_INPUT             = config.get("script_make_ma_input", "rules/make_MicroAnalysis_input.sh")
+SCRIPT_MA_PIPELINE_R        = config.get("script_ma_pipeline_r", "scripts/microbiomeanalyst_pipeline.R")
+SCRIPT_LEFSE_R              = config.get("script_lefse_r", "scripts/run_ma_lefse.R")
+SCRIPT_PICRUST_QC_EXPORT    = config.get("script_picrust_qc_export", "scripts/picrust2_qc_and_export.sh")
+SCRIPT_PICRUST_PLOT_R       = config.get("script_picrust_plot_r", "scripts/plot_kegg_by_class.R")
+SCRIPT_BUILD_REPORT         = config.get("script_build_report", "scripts/build_html_report.py")
+
+QIIME2_ENV_YAML             = config.get("qiime2_env_yaml", "envs/qiime2-amplicon-ubuntu-latest-conda.yml")
+PICRUST2_ENV_YAML           = config.get("picrust2_env_yaml", "envs/picrust2.yml")
+
+# -----------------------------
+# 1) Final target
+# -----------------------------
+rule all:
+    input:
+        # 분석 완료 플래그
+        ANALYZE_DONE,
+        # MA 업로드 3종
+        f"{MA_UPLOAD_DIR}/feature_table_for_MA.txt",
+        f"{MA_UPLOAD_DIR}/metadata_for_MA.txt",
+        f"{MA_UPLOAD_DIR}/taxonomy_for_MA.txt",
+        # MA 파이프라인 완료
+        f"{MA_OUTDIR}/.done_pipeline",
+        # pairwise LEfSe 완료
+        f"{LEFSE_OUTDIR}/.done_pairwise",
+        # 그림 수집 완료
+        f"{MA_OUTDIR}/.done_figures",
+        # PICRUSt2 + export + plot
+        f"{PICRU}/.done_picrust2",
+        f"{TGT}/KO_unstrat.tsv",
+        f"{TGT}/pathway_unstrat.tsv",
+        f"{PICRU}/plots_by_class/errorbar_by_class.pdf",
+        # 최종 리포트
+        f"{REPORT_DIR}/index.html"
+
+
+# =========================================================
+# 2) RefSeq 16S DB 구축 (존재 시 스킵)
+# =========================================================
+rule build_db:
+    output:
+        db  = f"{REF_DIR}/ncbi-refseqs-blastdb.qza",
+        tax = f"{REF_DIR}/ncbi-refseqs-taxonomy-derep.qza"
+    params:
+        script  = SCRIPT_BUILD_DB,
+        ref_dir = REF_DIR
+    shell:
+        r"""
+        set -euo pipefail
+        REF_DIR="{params.ref_dir}" bash "{params.script}"
+        """
+
+# =========================================================
+# 3) FASTQ → sample_manifest.txt
+# =========================================================
+rule make_manifest:
+    input:
+        db  = rules.build_db.output.db,
+        tax = rules.build_db.output.tax
+    output:
+        MANIFEST
+    params:
+        script    = SCRIPT_MAKE_MANIFEST,
+        analysis  = ANALYSIS,
+        fastq_dir = FASTQ_DIR,
+        r1        = SUFFIX_R1,
+        r2        = SUFFIX_R2
+    shell:
+        r"""
+        set -euo pipefail
+        ANALYSIS="{params.analysis}" FASTQ_DIR="{params.fastq_dir}" \
+        SUFFIX_R1="{params.r1}" SUFFIX_R2="{params.r2}" \
+        MANIFEST="{output}" bash "{params.script}"
+        """
+
+# =========================================================
+# 4) QIIME2 분석 (cutadapt/BLAST 등)
+# =========================================================
+rule run_qiime2:
+    input:
+        manifest = MANIFEST,
+        db       = rules.build_db.output.db,
+        tax      = rules.build_db.output.tax
+    output:
+        done_file = ANALYZE_DONE,
+        ft        = f"{ANALYSIS}/ASV_quantified/feature-table.txt",
+        rep_qza   = f"{ANALYSIS}/rep-seqs-dada2-2.qza",
+        tab_qza   = f"{ANALYSIS}/table-dada2-2.qza"
+    params:
+        script        = SCRIPT_QIIME2_ANALYZE,
+        analysis      = ANALYSIS,
+        threads_cut   = THREADS_CUTADAPT,
+        threads_blast = THREADS_BLAST,
+        ref_dir       = REF_DIR,
+        manifest      = MANIFEST
+    conda:
+        QIIME2_ENV_YAML
+    shell:
+        r"""
+        set -euo pipefail
+        mkdir -p .done
+        ANALYSIS="{params.analysis}" \
+        THREADS_CUTADAPT="{params.threads_cut}" THREADS_BLAST="{params.threads_blast}" \
+        REF_DIR="{params.ref_dir}" MANIFEST="{params.manifest}" \
+        bash "{params.script}"
+
+        test -s "{output.ft}"
+        test -s "{output.rep_qza}"
+        test -s "{output.tab_qza}"
+        date > "{output.done_file}"
+        """
+
+# =========================================================
+# 5) MicrobiomeAnalyst 업로드 파일 생성(feature/tax/meta)
+# =========================================================
+rule make_MicrobiomeAnalystR_input:
+    input:
+        ANALYZE_DONE,
+        f"{ANALYSIS}/ASV_quantified/feature-table.txt",
+        f"{ANALYSIS}/sample_manifest.txt",
+        script = SCRIPT_MA_INPUT
+    output:
+        ft   = f"{MA_UPLOAD_DIR}/feature_table_for_MA.txt",
+        meta = f"{MA_UPLOAD_DIR}/metadata_for_MA.txt",
+        tax  = f"{MA_UPLOAD_DIR}/taxonomy_for_MA.txt"
+    params:
+        analysis = ANALYSIS,
+        ma_dir   = MA_DIR
+    shell:
+        r"""
+        set -euo pipefail
+        chmod +x "{input.script}"
+        ANALYSIS="{params.analysis}" MA_DIR="{params.ma_dir}" \
+        bash "{input.script}"
+        test -s "{output.ft}"
+        test -s "{output.meta}"
+        test -s "{output.tax}"
+        """
+
+# =========================================================
+# 6) MicrobiomeAnalystR 전체 파이프라인 (alpha/beta/LEfSe 전 처리)
+# =========================================================
+rule run_MicrobiomeAnalyst_pipeline:
+    input:
+        ft    = f"{MA_UPLOAD_DIR}/feature_table_for_MA.txt",
+        meta  = f"{MA_UPLOAD_DIR}/metadata_for_MA.txt",
+        tax   = f"{MA_UPLOAD_DIR}/taxonomy_for_MA.txt",
+        script = SCRIPT_MA_PIPELINE_R
+    output:
+        touch(f"{MA_OUTDIR}/.done_pipeline")
+    params:
+        outdir = MA_OUTDIR,
+        group  = MA_GROUP,
+        rq     = RAREFY_Q,
+        pcut   = str(config.get("p_cut", 0.1)),
+        count_cut = str(config.get("count_cut", 4)),
+        rs_bin = RS_BIN
+    shell:
+        r"""
+        set -euo pipefail
+        mkdir -p "{params.outdir}"
+        "{params.rs_bin}" "{input.script}" \
+          --feat_fp "{input.ft}" \
+          --tax_fp  "{input.tax}" \
+          --meta_fp "{input.meta}" \
+          --outdir  "{params.outdir}" \
+          --group   "{params.group}" \
+          --p_cut   "{params.pcut}" \
+          --count_cut "{params.count_cut}" \
+          --rarefy_q {params.rq}
+        date > "{output}"
+        """
+
+# =========================================================
+# 7) pairwise LEfSe (ALL + 그룹쌍)
+# =========================================================
+rule run_MicrobiomeAnalyst_LefSe:
+    input:
+        ft     = f"{MA_UPLOAD_DIR}/feature_table_for_MA.txt",
+        meta   = f"{MA_UPLOAD_DIR}/metadata_for_MA.txt",
+        tax    = f"{MA_UPLOAD_DIR}/taxonomy_for_MA.txt",
+        script = SCRIPT_LEFSE_R
+    output:
+        touch(f"{LEFSE_OUTDIR}/.done_pairwise")
+    params:
+        outdir = LEFSE_OUTDIR,
+        group  = MA_GROUP,
+        rq     = RAREFY_Q,
+        pcut   = str(config.get("lefse_p_cut", 0.1)),
+        count_cut = str(config.get("lefse_count_cut", 4)),
+        rs_bin = RS_BIN
+    shell:
+        r"""
+        set -euo pipefail
+        mkdir -p "{params.outdir}"
+        "{params.rs_bin}" "{input.script}" \
+          --feat_fp "$(realpath "{input.ft}")" \
+          --tax_fp  "$(realpath "{input.tax}")" \
+          --meta_fp "$(realpath "{input.meta}")" \
+          --outdir  "$(realpath -m "{params.outdir}")" \
+          --group   "{params.group}" \
+          --p_cut   "{params.pcut}" \
+          --count_cut "{params.count_cut}" \
+          --rarefy_q {params.rq}
+        date > "{output}"
+        """
+
+# =========================================================
+# 8) 그림 수집 (평탄화)
+# =========================================================
+rule collect_ma_figures:
+    input:
+        f"{MA_OUTDIR}/.done_pipeline"
+    output:
+        touch(f"{MA_OUTDIR}/.done_figures")
+    params:
+        outdir = MA_OUTDIR,
+        dest   = f"{MA_OUTDIR}/99_Figures"
+    shell:
+        r"""
+        set -euo pipefail
+        OUT="{params.outdir}"
+        DEST="{params.dest}"
+        mkdir -p "$DEST"
+
+        find "$OUT" -type f \( -iname '*.png' -o -iname '*.pdf' -o -iname '*.svg' -o -iname '*.jpg' -o -iname '*.jpeg' \) ! -path "$DEST/*" -print0 \
+          | while IFS= read -r -d '' f; do
+                rel="${{f#"$OUT/"}}"
+                safe="${{rel//\//__}}"
+                cp -f "$f" "$DEST/$safe"
+            done
+
+        printf "collected\toriginal_path\n" > "$DEST/_index.tsv"
+        find "$DEST" -type f \( -iname '*.png' -o -iname '*.pdf' -o -iname '*.svg' -o -iname '*.jpg' -o -iname '*.jpeg' \) -printf "%f\t$OUT/99_Figures/%f\n" >> "$DEST/_index.tsv"
+
+        date > "{output}"
+        """
+
+# =========================================================
+# 9) PICRUSt2: QIIME2 산출물 export → 실행
+# =========================================================
+rule export_repseqs_fna:
+    input:
+        rep = f"{ANALYSIS}/rep-seqs-dada2-2.qza"
+    output:
+        fna = f"{ANALYSIS}/ASV_quantified/rep_seqs.fna"
+    shell:
+        r"""
+        set -euo pipefail
+        tmpdir="$(mktemp -d)"
+        qiime tools export --input-path "{input.rep}" --output-path "$tmpdir"
+        mkdir -p "$(dirname "{output.fna}")"
+        cp "$tmpdir/dna-sequences.fasta" "{output.fna}"
+        """
+
+rule export_table_biom:
+    input:
+        tab = f"{ANALYSIS}/table-dada2-2.qza"
+    output:
+        biom = f"{ANALYSIS}/ASV_quantified/table_seqs.biom"
+    shell:
+        r"""
+        set -euo pipefail
+        tmpdir="$(mktemp -d)"
+        qiime tools export --input-path "{input.tab}" --output-path "$tmpdir"
+        mkdir -p "$(dirname "{output.biom}")"
+        cp "$tmpdir/feature-table.biom" "{output.biom}"
+        """
+
+rule run_picrust2:
+    input:
+        fna  = f"{ANALYSIS}/ASV_quantified/rep_seqs.fna",
+        biom = f"{ANALYSIS}/ASV_quantified/table_seqs.biom"
+    output:
+        outdir = directory(f"{PICRU}"),
+        done   = f"{PICRU}/.done_picrust2"
+    threads: int(config.get("threads_picrust2", 40))
+    conda: PICRUST2_ENV_YAML
+    shell:
+        r"""
+        set -euo pipefail
+        OUTDIR="{output.outdir}"
+        WORKDIR="$(mktemp -d)"
+        trap 'rm -rf "$WORKDIR"' EXIT
+
+        picrust2_pipeline.py \
+          -s "{input.fna}" \
+          -i "{input.biom}" \
+          -o "$WORKDIR/out" \
+          -p {threads}
+
+        rm -rf "$OUTDIR"
+        mkdir -p "$(dirname "$OUTDIR")"
+        mv "$WORKDIR/out" "$OUTDIR"
+        date > "{output.done}"
+        """
+
+# Bash로 QC + export (unstrat only)
+rule qc_and_export_picrust2:
+    input:
+        flag = f"{PICRU}/.done_picrust2"
+    output:
+        ko_un = f"{TGT}/KO_unstrat.tsv",
+        pw_un = f"{TGT}/pathway_unstrat.tsv",
+        nsti  = f"{TGT}/nsti_summary.txt"
+    params:
+        OUTDIR = PICRU,
+        TGT    = TGT,
+        script = SCRIPT_PICRUST_QC_EXPORT
+    shell:
+        r"""
+        set -euo pipefail
+        bash "{params.script}" "{params.OUTDIR}" "{params.TGT}"
+        """
+
+# KEGG by group (errorbar_by_class.pdf만 생성)
+rule plot_kegg_by_class:
+    input:
+        ko_un = f"{TGT}/KO_unstrat.tsv",
+        meta  = f"{MA_DIR}/upload/metadata_for_MA.txt"
+    output:
+        pdf = f"{PICRU}/plots_by_class/errorbar_by_class.pdf"
+    params:
+        out_dir = f"{PICRU}/plots_by_class",
+        group   = MA_GROUP,
+        topn    = int(config.get("picrust_topn", 5)),
+        rs_bin  = RS_BIN,
+        script  = SCRIPT_PICRUST_PLOT_R
+    shell:
+        r"""
+        set -euo pipefail
+        mkdir -p "{params.out_dir}"
+        "{params.rs_bin}" "{params.script}" \
+          "{input.ko_un}" "{input.meta}" "{params.group}" "{params.out_dir}" "{params.topn}"
+        test -s "{output.pdf}"
+        """
+
+# =========================================================
+# 10) HTML Report (계층형, assets 포함)
+# =========================================================
+#
+
+rule build_html_report:
+    input:
+        ma_done    = f"{MA_OUTDIR}/.done_figures",
+        lefse_done = f"{LEFSE_OUTDIR}/.done_pairwise",
+        pic_done   = f"{PICRU}/.done_picrust2",
+        pic_pdf    = f"{PICRU}/plots_by_class/errorbar_by_class.pdf"
+    output:
+        html = f"{REPORT_DIR}/index.html"
+    params:
+        ma_outdir        = MA_OUTDIR,
+        ma_fig_dir       = f"{MA_OUTDIR}/99_Figures",
+        lefse_csv        = f"{LEFSE_OUTDIR}/lefse_de_output.csv",
+        lefse_dir        = LEFSE_OUTDIR,
+        picrust_plot_dir = f"{PICRU}/plots_by_class",
+        outdir           = REPORT_DIR,
+        py               = SCRIPT_BUILD_REPORT
+    shell:
+        r"""
+        set -euo pipefail
+        mkdir -p "{params.outdir}"
+        python3 "{params.py}" \
+          --ma_outdir "{params.ma_outdir}" \
+          --ma_fig_dir "{params.ma_fig_dir}" \
+          --lefse_csv "{params.lefse_csv}" \
+          --lefse_dir "{params.lefse_dir}" \
+          --picrust_plot_dir "{params.picrust_plot_dir}" \
+          --outdir "{params.outdir}" \
+          --mode copy
+        test -s "{output.html}"
+        """
+
+
+# ================================================================
+# junk file들 모아두기
+# ================================================================
+# ===== 잡파일 이동 (현재 작업 디렉토리에서) =====
+from snakemake.shell import shell
+shell.executable("/bin/bash")
+
+JUNK_DIR = "_intermediate"
+
+rule sweep_workspace:
+    """
+    현재 작업 디렉토리의 중간 산출물/잡파일을 _intermediate/ 로 이동.
+    이동 대상: data.orig*, data.prefilt*, filt.data.orig*, *.qs, git (디렉터리)
+    """
+    output:
+        touch(f"{JUNK_DIR}/.done_sweep")
+    params:
+        junk_dir = JUNK_DIR,
+        # 필요시 여기에 패턴을 추가/수정
+        pats = "data.orig* data.prefilt* filt.data.orig* *.qs git data.proc* proc* data* orig.*"
+    shell:
+        r"""
+        set -euo pipefail
+        mkdir -p "{params.junk_dir}"
+
+        shopt -s nullglob dotglob
+
+        # 패턴을 bash 배열로
+        patterns=({params.pats})
+
+        for pat in "${{patterns[@]}}"; do
+          # 현재 디렉토리 바로 아래만 대상으로(하위 폴더는 스킵)
+          matches=( ./$pat )
+          (( ${{#matches[@]}} )) || continue
+
+          for f in "${{matches[@]}}"; do
+            base="$(basename "$f")"
+            # 중요 파일/폴더 제외
+            case "$base" in
+              .|..|Snakefile|Snakefile_*|config.yaml|report|{params.junk_dir}) continue ;;
+            esac
+            # 이미 목적지 안이면 스킵
+            [[ "$f" == "./{params.junk_dir}"* ]] && continue
+
+            mv -f -- "$f" "{params.junk_dir}/" || true
+          done
+        done
+
+        date > "{output}"
+        """
+
