@@ -29,6 +29,19 @@ R packages used in this pipeline:
 `optparse`, `data.table`, `pheatmap`, `reshape2`, `vegan`, `phyloseq`, `withr`, `tidyr`,  
 `MicrobiomeAnalystR`.
 
+### Note: Installing Tax4Fun on Linux
+
+`Tax4Fun` is no longer available on CRAN, so it needs to be installed from the original website as a source tarball.
+
+
+1. Download the tarball:
+
+```bash
+wget http://tax4fun.gobics.de/Tax4Fun/Tax4Fun_0.3.1.tar.gz
+install.packages("Tax4Fun_0.3.1.tar.gz",
+                 repos = NULL,
+                 type  = "source")
+```
 ---
 
 ## 1) Install via Conda/Mamba
