@@ -1,443 +1,705 @@
 #!/usr/bin/env Rscript
+.libPaths("/home/ljb/R/x86_64-pc-linux-gnu-library/4.4")
+
+# Microbiome analysis pipeline (R) with sweep-able parameters.
+# - Inputs: feature table (rows=feature, cols=samples), taxonomy table (rows=feature), metadata table (rows=samples)
+# - Outputs: standardized folders under --outdir:
+#     00_QC_Normalization/
+#     01_Alpha/
+#     02_Beta/
+#     03_Composition/
+#
+# Notes:
+# - Designed to be driven by Snakefile3 sweeps.
+# - Does NOT depend on the MicrobiomeAnalyst web app; it reproduces common steps using phyloseq/vegan/ggplot2.
 
 suppressPackageStartupMessages({
   library(optparse)
-  library(withr)
-  library(MicrobiomeAnalystR)
-  library(phyloseq)
-  library(vegan)
-  library(ggplot2)
+  library(data.table)
   library(dplyr)
   library(tidyr)
-  library(readr)
-  library(stringr)
+  library(ggplot2)
+  library(phyloseq)
+  library(vegan)
 })
 
-## ===== CLI =====
+# -------------------------------------------------
+# Fail-safe helpers: keep snakemake running, but leave a clear error marker
+# -------------------------------------------------
+write_error_and_quit <- function(outdir, msg) {
+  dir_create(outdir)
+  writeLines(as.character(msg), file.path(outdir, "PIPELINE_ERROR.txt"))
+  message(msg)
+  quit(save = "no", status = 0)
+}
+
+# -----------------------
+# CLI
+# -----------------------
 opt_list <- list(
-  make_option("--feat_fp",  type="character"),
-  make_option("--tax_fp",   type="character"),
-  make_option("--meta_fp",  type="character"),
-  make_option("--outdir",   type="character"),
-  make_option("--group",    type="character", default="Group1"),
-  make_option("--rank",     type="character", default="Genus"),
-  make_option("--lda_cut",  type="double",    default=2.0),
-  make_option("--p_cut",    type="double",    default=0.10),
-  make_option("--count_cut",    type="double",    default=4),
-  make_option("--rarefy_q", type="double",    default=0.00)
+  make_option("--feat_fp", type = "character", help = "Feature table (MA format)"),
+  make_option("--tax_fp", type = "character", help = "Taxonomy table (MA format)"),
+  make_option("--meta_fp", type = "character", help = "Metadata table (MA format)"),
+  make_option("--outdir", type = "character", help = "Output directory"),
+  make_option("--group", type = "character", default = "Group1", help = "Grouping column in metadata"),
+
+  # filtering
+  make_option("--filter_enabled",
+    type = "character", default = "true",
+    help = "true/false: apply abundance + prevalence + IQR filters"
+  ),
+  make_option("--min_total_count", type = "double", default = 4, help = "Min total count per feature"),
+  make_option("--prevalence", type = "double", default = 0.10, help = "Min prevalence fraction (0-1)"),
+  make_option("--iqr_remove", type = "double", default = 0.10, help = "Remove lowest IQR fraction (0-1)"),
+
+  # normalization
+  make_option("--scale",
+    type = "character", default = "rarefy",
+    help = "none|tss|rarefy"
+  ),
+  make_option("--rarefy_depth",
+    type = "integer", default = 0,
+    help = "Depth for rarefaction (0 => use min library size)"
+  ),
+  make_option("--rarefy_q",
+    type = "double", default = 0.0,
+    help = "Quantile for rarefaction depth if rarefy_depth=0 (0-1). Ignored if rarefy_depth>0"
+  ),
+  make_option("--transform",
+    type = "character", default = "none",
+    help = "none|log|clr"
+  ),
+  make_option("--pseudocount", type = "double", default = 1, help = "Pseudocount for log/clr transforms"),
+  make_option("--seed", type = "integer", default = 22, help = "Random seed"),
+
+  # alpha/beta selections (comma-separated)
+  make_option("--alpha_ranks",
+    type = "character", default = "ASV,Genus,Family",
+    help = "Comma-separated ranks for alpha diversity"
+  ),
+  make_option("--alpha_measures",
+    type = "character", default = "Observed,Chao1,Shannon,Simpson",
+    help = "Comma-separated alpha measures"
+  ),
+  make_option("--alpha_stats",
+    type = "character", default = "kruskal,wilcoxon,anova",
+    help = "Comma-separated alpha stats methods"
+  ),
+  make_option("--beta_ranks",
+    type = "character", default = "Genus,Family",
+    help = "Comma-separated ranks for beta diversity"
+  ),
+  make_option("--beta_distances",
+    type = "character", default = "bray,jaccard,euclidean",
+    help = "Comma-separated beta distances"
+  ),
+  make_option("--beta_ordinations",
+    type = "character", default = "PCoA,NMDS",
+    help = "Comma-separated ordinations"
+  ),
+  make_option("--beta_stats",
+    type = "character", default = "permanova,anosim",
+    help = "Comma-separated beta stats methods"
+  ),
+  make_option("--permutations", type = "integer", default = 999, help = "Permutations for PERMANOVA/ANOSIM")
 )
-opt <- parse_args(OptionParser(option_list=opt_list))
-stopifnot(!is.null(opt$feat_fp), !is.null(opt$tax_fp), !is.null(opt$meta_fp), !is.null(opt$outdir))
 
-feat_fp <- opt$feat_fp
-tax_fp  <- opt$tax_fp
-meta_fp <- opt$meta_fp
-outdir  <- opt$outdir
-grp     <- opt$group
-rank_use<- opt$rank
-lda_cut <- opt$lda_cut
-p_cut   <- opt$p_cut
-count_cut   <- opt$count_cut
-rq      <- opt$rarefy_q
+opt <- parse_args(OptionParser(option_list = opt_list))
 
-dir.create(outdir, showWarnings = FALSE, recursive = TRUE)
-mkdir <- function(name){ d <- file.path(outdir, name); dir.create(d, FALSE, TRUE); d }
-
-## ===== MicrobiomeAnalystR: Load & QC =====
-mbSet <- Init.mbSetObj()
-mbSet <- SetModuleType(mbSet, "mdp")
-mbSet <- ReadSampleTable(mbSet, meta_fp)
-mbSet <- Read16STaxaTable(mbSet, tax_fp)
-mbSet <- Read16SAbundData(mbSet, feat_fp, "text", "QIIME", "T", "false")
-mbSet <- SanityCheckData(mbSet, "text", "sample", "true")
-mbSet <- SanityCheckSampleData(mbSet)
-mbSet <- SetMetaAttributes(mbSet, "1")
-
-dir_qc <- mkdir("00_QC_Normalization")
-with_dir(dir_qc, { try(PlotLibSizeView(mbSet, "norm_libsizes_before", "png"), silent=TRUE) })
-
-mbSet <- CreatePhyloseqObj(mbSet, "text", "QIIME", "F", "false")
-mbSet <- ApplyAbundanceFilter(mbSet, "prevalence", count_cut, p_cut) # change to input parameter
-mbSet <- ApplyVarianceFilter(mbSet, "iqr", 0.10)
-
-libsizes <- phyloseq::sample_sums(mbSet$dataSet$proc.phyobj)
-if (length(libsizes) == 0) stop("No samples detected after filtering.")
-min_depth <- if (rq > 0 && rq < 1) floor(quantile(libsizes, rq)) else min(libsizes)
-
-mbSet <- PerformNormalization(mbSet, "none", "colsum", "none", "true", 30000) # change to input parameter
-with_dir(dir_qc, { try(PlotLibSizeView(mbSet, "norm_libsizes_after", "png"), silent=TRUE) })
-
-## ===== common ps/meta =====
-ps <- mbSet$dataSet$proc.phyobj
-if (is.null(ps) || !inherits(ps, "phyloseq")) stop("proc.phyobj is not a phyloseq object.")
-meta_df <- as(sample_data(ps), "data.frame")
-stopifnot(grp %in% colnames(meta_df))
-meta_df[[grp]] <- factor(meta_df[[grp]])
-
-## 작은 헬퍼: 문자열로 formula 생성
-fml <- function(response, group_col) reformulate(group_col, response=response)
-
-## ===== 01 Alpha =====
-dir_alpha <- mkdir("01_Alpha")
-with_dir(dir_alpha, {
-  alpha_df <- estimate_richness(ps, measures=c("Chao1","Shannon")) %>%
-    tibble::rownames_to_column("Sample") %>%
-    left_join(meta_df %>% tibble::rownames_to_column("Sample") %>% select(Sample, all_of(grp)),
-              by="Sample")
-  write_tsv(alpha_df, "alpha_values.tsv")
-  
-  ## Kruskal
-  kw_chao <- try(kruskal.test(formula = fml("Chao1", grp),   data=alpha_df), silent=TRUE)
-  kw_shan <- try(kruskal.test(formula = fml("Shannon", grp), data=alpha_df), silent=TRUE)
-  if (!inherits(kw_chao,"try-error")) capture.output(kw_chao, file="kruskal_chao1.txt")
-  if (!inherits(kw_shan,"try-error")) capture.output(kw_shan, file="kruskal_shannon.txt")
-  
-  ## ANOVA (aov)
-  aov_chao <- aov(formula = fml("Chao1", grp),   data=alpha_df)
-  aov_shan <- aov(formula = fml("Shannon", grp), data=alpha_df)
-  sm_chao <- summary(aov_chao)[[1]]; sm_shan <- summary(aov_shan)[[1]]
-  lab_chao <- sprintf("P : %.4g; [ANOVA]F-value : %.3f", sm_chao$`Pr(>F)`[1], sm_chao$`F value`[1])
-  lab_shan <- sprintf("P : %.4g; [ANOVA]F-value : %.3f", sm_shan$`Pr(>F)`[1], sm_shan$`F value`[1])
-  writeLines(sprintf("Chao1 ANOVA: F=%.3f, P=%.4g", sm_chao$`F value`[1], sm_chao$`Pr(>F)`[1]), "anova_chao1.txt")
-  writeLines(sprintf("Shannon ANOVA: F=%.3f, P=%.4g", sm_shan$`F value`[1], sm_shan$`Pr(>F)`[1]), "anova_shannon.txt")
-  
-  p1 <- ggplot(alpha_df, aes(x=.data[[grp]], y=Chao1, fill=.data[[grp]])) +
-    geom_boxplot(outlier.shape=NA) + geom_jitter(width=0.15, alpha=.6, size=1.8) +
-    theme_bw(12) + labs(title="Alpha Diversity: Chao1", x=NULL, y="Chao1") +
-    annotate("text", x=-Inf, y=Inf, label=lab_chao, hjust=-.1, vjust=1.3, size=4)
-  ggsave("alpha_chao1_boxplot.png", p1, width=7, height=5, dpi=200)
-  
-  p2 <- ggplot(alpha_df, aes(x=.data[[grp]], y=Shannon, fill=.data[[grp]])) +
-    geom_boxplot(outlier.shape=NA) + geom_jitter(width=0.15, alpha=.6, size=1.8) +
-    theme_bw(12) + labs(title="Alpha Diversity: Shannon", x=NULL, y="Shannon") +
-    annotate("text", x=-Inf, y=Inf, label=lab_shan, hjust=-.1, vjust=1.3, size=4)
-  ggsave("alpha_shannon_boxplot.png", p2, width=7, height=5, dpi=200)
-})
-
-## ===== 02 Beta =====
-dir_beta <- mkdir("02_Beta")
-with_dir(dir_beta, {
-  taxranks <- colnames(tax_table(ps))
-  rk <- if ("Genus" %in% taxranks) "Genus" else tail(taxranks,1)
-  ps_gen <- suppressWarnings(tax_glom(ps, taxrank=rk, NArm=TRUE))
-  ps_rel <- transform_sample_counts(ps_gen, function(x) if (sum(x)==0) x else x/sum(x))
-  
-  dist_bray <- phyloseq::distance(ps_rel, method="bray")
-  ord <- ordinate(ps_rel, method="PCoA", distance=dist_bray)
-  
-  md <- meta_df %>% tibble::rownames_to_column("Sample") %>% select(Sample, all_of(grp))
-  pcoa_df <- as.data.frame(ord$vectors[,1:2]) %>%
-    tibble::rownames_to_column("Sample") %>% left_join(md, by="Sample")
-  colnames(pcoa_df)[2:3] <- c("PCoA1","PCoA2")
-  
-  pc1 <- tryCatch(100*ord$values$Relative_eig[1], error=function(e) NA_real_)
-  pc2 <- tryCatch(100*ord$values$Relative_eig[2], error=function(e) NA_real_)
-  xlab <- if (is.na(pc1)) "PCoA1" else sprintf("PCoA1 (%.1f%%)", pc1)
-  ylab <- if (is.na(pc2)) "PCoA2" else sprintf("PCoA2 (%.1f%%)", pc2)
-  
-  ## adonis2도 formula 필요 → 컬럼명을 안전하게 바꿔 사용
-  meta_df_ad <- meta_df
-  meta_df_ad$.Group <- meta_df_ad[[grp]]
-  ad <- adonis2(dist_bray ~ .Group, data=meta_df_ad, permutations=999)
-  Fv <- ad$F[1]; R2 <- ad$R2[1]; Pv <- ad$`Pr(>F)`[1]
-  write_tsv(as.data.frame(ad) %>% tibble::rownames_to_column("term"), "permanova_bray_all.tsv")
-  
-  subt <- sprintf("[PERMANOVA] F-value: %.4f; R-squared: %.5f; p-value: %.3g", Fv, R2, Pv)
-  gp <- ggplot(pcoa_df, aes(PCoA1, PCoA2, color=.data[[grp]])) +
-    geom_point(size=2, alpha=.9) +
-    stat_ellipse(level=.95, linetype=2, linewidth=.5, show.legend=FALSE) +
-    theme_bw(12) + labs(title=sprintf("PCoA (Bray, %s)", rk), subtitle=subt, x=xlab, y=ylab)
-  ggsave("pcoa_bray_genus.png", gp, width=7, height=5, dpi=200)
-  
-  ## pairwise PERMANOVA
-  groups <- levels(meta_df[[grp]])
-  if (length(groups) >= 2) {
-    pairs <- t(combn(groups,2)) %>% as.data.frame()
-    colnames(pairs) <- c("g1","g2")
-    pair_dir <- "pairs"; dir.create(pair_dir, FALSE, TRUE)
-    
-    res <- purrr::pmap_dfr(pairs, function(g1,g2){
-      keep <- rownames(meta_df)[meta_df[[grp]] %in% c(g1,g2)]
-      if (length(keep) < 4) return(tibble(g1=g1,g2=g2,F=NA_real_,R2=NA_real_,p=NA_real_,n=length(keep)))
-      subD  <- as.dist(as.matrix(dist_bray)[keep, keep])
-      subMD <- meta_df[keep, , drop=FALSE]; subMD$.Group <- subMD[[grp]]
-      
-      ad2 <- adonis2(subD ~ .Group, data=subMD, permutations=999)
-      F2 <- ad2$F[1]; R2_ <- ad2$R2[1]; P2 <- ad2$`Pr(>F)`[1]
-      
-      ps_pair <- prune_samples(keep, ps_rel)
-      ord_p <- ordinate(ps_pair, method="PCoA", distance="bray")
-      p_df <- as.data.frame(ord_p$vectors[,1:2]) %>%
-        tibble::rownames_to_column("Sample") %>%
-        left_join(meta_df %>% tibble::rownames_to_column("Sample") %>% select(Sample, all_of(grp)), by="Sample")
-      colnames(p_df)[2:3] <- c("PCoA1","PCoA2")
-      subt2 <- sprintf("[PERMANOVA] F-value: %.4f; R-squared: %.5f; p-value: %.3g", F2, R2_, P2)
-      
-      gpp <- ggplot(p_df, aes(PCoA1, PCoA2, color=.data[[grp]])) +
-        geom_point(size=2) +
-        stat_ellipse(level=.95, linetype=2, linewidth=.5, show.legend=FALSE) +
-        theme_bw(12) + labs(title=sprintf("PCoA (Bray, %s vs %s)", g1, g2), subtitle=subt2)
-      
-      fn <- file.path(pair_dir, sprintf("pcoa_bray_%s_vs_%s.png",
-                                        str_replace_all(g1, "[^A-Za-z0-9]+","-"),
-                                        str_replace_all(g2, "[^A-Za-z0-9]+","-")))
-      ggsave(fn, gpp, width=7, height=5, dpi=200)
-      
-      tibble(g1=g1,g2=g2,F=F2,R2=R2_,p=P2,n=length(keep))
-    })
-    res <- res %>% mutate(p_adj = p.adjust(p, method="BH"))
-    write_tsv(res, "pairwise_permanova_bray.tsv")
-  }
-})
-
-## =====================================================================
-## 03_Composition (그림 + 모든 랭크 Sam×Grp bar + proportion 테이블 저장)
-## =====================================================================
-dir_comp <- mkdir("03_Composition")
-
-# ---- A) 기존 Phylum/Genus barplot (샘플×그룹 facet) ----
-with_dir(dir_comp, {
-  ranks_to_plot <- c("Phylum","Class","Order","Family","Genus","Species")
-  for (rk in ranks_to_plot) {
-    if (!(rk %in% colnames(tax_table(ps)))) next
-    ps_rk  <- suppressWarnings(tax_glom(ps, taxrank = rk, NArm = TRUE))
-    ps_rel <- transform_sample_counts(ps_rk, function(x) if (sum(x) == 0) x else x / sum(x))
-    
-    df <- psmelt(ps_rel) |>
-      dplyr::select(Sample, all_of(grp), OTU, Abundance, all_of(rk)) |>
-      dplyr::rename(Rank = !!sym(rk))
-    
-    topN <- if (rk == "Genus") 20 else 10
-    top_taxa <- df |>
-      dplyr::group_by(Rank) |>
-      dplyr::summarise(total = sum(Abundance), .groups = "drop") |>
-      dplyr::arrange(dplyr::desc(total)) |>
-      dplyr::slice_head(n = topN) |>
-      dplyr::pull(Rank)
-    
-    df <- df |>
-      dplyr::mutate(Rank2 = ifelse(Rank %in% top_taxa, Rank, "Others"))
-    
-    df_sum <- df |>
-      dplyr::group_by(Sample, .data[[grp]], Rank2) |>
-      dplyr::summarise(Abundance = sum(Abundance), .groups = "drop")
-    
-    p <- ggplot(df_sum, aes(x = Sample, y = Abundance, fill = Rank2)) +
-      geom_bar(stat = "identity", width = .95) +
-      facet_grid(~ .data[[grp]], scales = "free_x", space = "free_x") +
-      theme_bw(12) +
-      theme(axis.text.x = element_text(angle = 90, vjust = .5, hjust = 1)) +
-      labs(title = sprintf("Taxonomic composition (%s)", rk), x = "Sample", y = "Relative abundance")
-    
-    ggsave(sprintf("barplot_%s.png", tolower(rk)), p, width = 14, height = 6, dpi = 200)
-  }
-})
-# 
-# # ---- B) MicrobiomeAnalystR: 모든 rank에 대해 PlotTaxaAbundanceBarSamGrp ----
-# dir_comp_samgrp <- file.path(dir_comp, "SamGrpBars")
-# dir.create(dir_comp_samgrp, showWarnings = FALSE, recursive = TRUE)
-# 
-# with_dir(dir_comp_samgrp, {
-#   ranks_all <- c("Kingdom","Phylum","Class","Order","Family","Genus","Species")
-#   
-#   run_safely <- function(expr) {
-#     tryCatch(force(expr),
-#              error = function(e){ message("Skip: ", conditionMessage(e)); invisible(NULL) })
-#   }
-#   
-#   for (rk in ranks_all) {
-#     if (!(rk %in% colnames(tax_table(ps)))) {
-#       message("Skip SamGrp bar (rank missing): ", rk); next
-#     }
-#     img_base <- sprintf("taxa_bar_samgrp_%s", tolower(rk))
-#     message(">> PlotTaxaAbundanceBarSamGrp: ", rk)
-#     run_safely({
-#       # (imgName, taxRank, colorFac, facetFac, type, topNum, palette, sumMethod, featNum, legendPos, showOther, fmt)
-#       mbSet <<- PlotTaxaAbundanceBarSamGrp(
-#         mbSet,
-#         img_base,
-#         rk,
-#         grp,     # color
-#         grp,     # facet
-#         "barnorm",
-#         10,
-#         "set3",
-#         "sum",
-#         10,
-#         "bottom",
-#         "F",
-#         "png"
-#       )
-#     })
-#   }
-# })
-
-
-# ---- B) SamGrpBars를 ggplot으로 직접 생성 (샘플×그룹 & 그룹평균) ----
-dir_comp_samgrp <- file.path(dir_comp, "SamGrpBars")
-dir.create(dir_comp_samgrp, showWarnings = FALSE, recursive = TRUE)
-
-.clean_taxon <- function(x, rk) {
-  x <- as.character(x)
-  x[is.na(x) | x == "" | x == "NA"] <- paste0("Unclassified_", rk)
-  x
+# -----------------------
+# helpers
+# -----------------------
+dir_create <- function(p) {
+  dir.create(p, recursive = TRUE, showWarnings = FALSE)
 }
 
-make_samgrp_plots_one_rank <- function(ps, rk, grp, outdir, topN = 10) {
-  if (!(rk %in% colnames(tax_table(ps)))) {
-    message("Skip SamGrpBars (rank missing): ", rk)
-    return(invisible(NULL))
+split_csv <- function(x) {
+  if (is.null(x) || is.na(x) || x == "") {
+    return(character())
   }
-  
-  # rank로 집계 후 sample별 상대풍부도
-  ps_rk  <- suppressWarnings(tax_glom(ps, taxrank = rk, NArm = TRUE))
-  ps_rel <- transform_sample_counts(ps_rk, function(x) if (sum(x) == 0) x else x / sum(x))
-  
-  df <- psmelt(ps_rel) |>
-    dplyr::select(Sample, all_of(grp), OTU, Abundance, all_of(rk)) |>
-    dplyr::rename(Group = !!sym(grp), Taxon = !!sym(rk)) |>
-    dplyr::mutate(Taxon = .clean_taxon(Taxon, rk))
-  
-  # 상위 topN taxon만 표기, 나머지 Others
-  top_taxa <- df |>
-    dplyr::group_by(Taxon) |>
-    dplyr::summarise(total = sum(Abundance), .groups = "drop") |>
-    dplyr::arrange(dplyr::desc(total)) |>
-    dplyr::slice_head(n = topN) |>
-    dplyr::pull(Taxon)
-  
-  df <- df |>
-    dplyr::mutate(Taxon2 = ifelse(Taxon %in% top_taxa, Taxon, "Others"))
-  
-  # (1) 샘플별 스택바: x=Sample, facet=Group  → SamGrpBars_sample
-  df_samp <- df |>
-    dplyr::group_by(Sample, Group, Taxon2) |>
-    dplyr::summarise(Abundance = sum(Abundance), .groups = "drop")
-  
-  # 그룹 내 샘플 순서를 Group별로 묶어서 정렬
-  sample_order <- df_samp |>
-    dplyr::group_by(Group, Sample) |>
-    dplyr::summarise(tot = sum(Abundance), .groups = "drop") |>
-    dplyr::arrange(Group, dplyr::desc(tot)) |>
-    dplyr::pull(Sample)
-  
-  df_samp$Sample <- factor(df_samp$Sample, levels = unique(sample_order))
-  
-  p_samp <- ggplot(df_samp, aes(x = Sample, y = Abundance, fill = Taxon2)) +
-    geom_col(width = 0.95) +
-    facet_grid(~ Group, scales = "free_x", space = "free_x") +
-    theme_bw(12) +
-    theme(axis.text.x = element_text(angle = 90, vjust = .5, hjust = 1)) +
-    labs(title = sprintf("Taxonomic composition (Sample × Group) • %s", rk),
-         x = "Sample", y = "Relative abundance")
-  
-  fn1 <- file.path(outdir, sprintf("taxa_bar_SamGrpBars_sample_%s.png", tolower(rk)))
-  ggsave(fn1, p_samp, width = 14, height = 6, dpi = 200)
-  ggsave(sub("\\.png$", ".pdf", fn1), p_samp, width = 14, height = 6)
-  
-  # (2) 그룹평균 스택바: x=Group, y=mean(rel)  → SamGrpBars_groupmean
-  df_group <- df |>
-    dplyr::group_by(Group, Taxon2, Sample) |>
-    dplyr::summarise(Abundance = sum(Abundance), .groups = "drop") |>
-    dplyr::group_by(Group, Taxon2) |>
-    dplyr::summarise(mean_rel = mean(Abundance, na.rm = TRUE), .groups = "drop")
-  
-  p_grp <- ggplot(df_group, aes(x = Group, y = mean_rel, fill = Taxon2)) +
+  trimws(strsplit(x, ",", fixed = TRUE)[[1]])
+}
+
+is_true <- function(x) tolower(trimws(x)) %in% c("1", "true", "t", "yes", "y")
+
+as_frac <- function(x) {
+  if (is.null(x) || is.na(x)) {
+    return(x)
+  }
+  if (is.numeric(x) && length(x) == 1 && x > 1) {
+    return(x / 100)
+  }
+  return(x)
+}
+
+safe_tax_glom <- function(ps, rk) {
+  if (rk == "ASV") {
+    return(ps)
+  }
+  tt <- tryCatch(tax_table(ps), error = function(e) NULL)
+  if (is.null(tt)) {
+    return(NULL)
+  }
+  cn <- colnames(tt)
+  if (is.null(cn) || !(rk %in% cn)) {
+    return(NULL)
+  }
+  out <- tryCatch(tax_glom(ps, taxrank = rk, NArm = FALSE), error = function(e) NULL)
+  return(out)
+}
+
+tidy_kruskal <- function(test) {
+  data.frame(statistic = unname(test$statistic), df = unname(test$parameter), p.value = test$p.value, check.names = FALSE)
+}
+tidy_wilcox <- function(test) {
+  data.frame(statistic = unname(test$statistic), p.value = test$p.value, check.names = FALSE)
+}
+tidy_anova <- function(fit) {
+  sm <- summary(fit)[[1]]
+  sm <- data.frame(term = rownames(sm), sm, check.names = FALSE)
+  rownames(sm) <- NULL
+  sm
+}
+
+
+# For taxonomy ranks (case-insensitive match)
+normalize_rank <- function(r) {
+  r2 <- trimws(r)
+  if (tolower(r2) == "asv") {
+    return("ASV")
+  }
+  # Common taxonomy column names in MA taxonomy_for_MA.txt:
+  # Kingdom Phylum Class Order Family Genus Species
+  # Keep as-is
+  r2
+}
+
+# -----------------------
+# I/O
+# -----------------------
+set.seed(opt$seed)
+
+outdir <- opt$outdir
+dir_create(outdir)
+
+qc_dir <- file.path(outdir, "00_QC_Normalization")
+alpha_dir <- file.path(outdir, "01_Alpha")
+beta_dir <- file.path(outdir, "02_Beta")
+comp_dir <- file.path(outdir, "03_Composition")
+dir_create(qc_dir)
+dir_create(alpha_dir)
+dir_create(beta_dir)
+dir_create(comp_dir)
+
+# Read tables
+feat <- fread(opt$feat_fp, data.table = FALSE)
+stopifnot(ncol(feat) >= 3)
+rownames(feat) <- feat[[1]]
+feat[[1]] <- NULL
+feat_mat <- as.matrix(feat)
+mode(feat_mat) <- "numeric"
+
+tax <- fread(opt$tax_fp, data.table = FALSE)
+rownames(tax) <- tax[[1]]
+tax[[1]] <- NULL
+
+meta <- fread(opt$meta_fp, data.table = FALSE)
+if (!("#NAME" %in% colnames(meta))) {
+  # allow "Sample" only
+  if ("Sample" %in% colnames(meta)) meta$`#NAME` <- meta$Sample
+}
+stopifnot("#NAME" %in% colnames(meta))
+rownames(meta) <- meta$`#NAME`
+
+# align samples
+common_samples <- intersect(colnames(feat_mat), rownames(meta))
+if (length(common_samples) < 2) stop("Too few matched samples between feature table and metadata.")
+feat_mat <- feat_mat[, common_samples, drop = FALSE]
+meta <- meta[common_samples, , drop = FALSE]
+
+# group column
+if (!(opt$group %in% colnames(meta))) {
+  stop(sprintf(
+    "Group column '%s' not found in metadata columns: %s",
+    opt$group, paste(colnames(meta), collapse = ", ")
+  ))
+}
+meta[[opt$group]] <- as.factor(meta[[opt$group]])
+
+# align taxonomy rows
+common_taxa <- intersect(rownames(feat_mat), rownames(tax))
+feat_mat <- feat_mat[common_taxa, , drop = FALSE]
+tax <- tax[common_taxa, , drop = FALSE]
+
+# Build phyloseq object
+OTU <- otu_table(feat_mat, taxa_are_rows = TRUE)
+TAX <- tax_table(as.matrix(tax))
+SAM <- sample_data(as.data.frame(meta))
+ps0 <- phyloseq(OTU, TAX, SAM)
+
+# -----------------------
+# Filtering
+# -----------------------
+n_taxa0 <- ntaxa(ps0)
+n_samp0 <- nsamples(ps0)
+
+ps_f <- ps0
+if (is_true(opt$filter_enabled)) {
+  otu <- as(otu_table(ps_f), "matrix")
+  # abundance + prevalence (MicrobiomeAnalyst-style)
+  # - keep features that have count >= count_cut in at least `prevalence` fraction of samples
+  # - also require total count >= count_cut (light safeguard)
+  count_cut <- opt$min_total_count
+  total <- rowSums(otu)
+  prev <- rowSums(otu >= count_cut) / ncol(otu)
+
+  keep1 <- (total >= count_cut) & (prev >= opt$prevalence)
+  n_taxa_after_lowcount <- sum(keep1, na.rm = TRUE)
+  ps_f <- prune_taxa(keep1, ps_f)
+
+  # IQR filter (remove lowest fraction)
+  otu2 <- as(otu_table(ps_f), "matrix")
+  if (nrow(otu2) > 0 && opt$iqr_remove > 0) {
+    iqr <- apply(otu2, 1, IQR)
+    n_rm <- floor(length(iqr) * opt$iqr_remove)
+    if (n_rm > 0) {
+      rm_ids <- names(sort(iqr, decreasing = FALSE))[seq_len(n_rm)]
+      ps_f <- prune_taxa(!(taxa_names(ps_f) %in% rm_ids), ps_f)
+    }
+  }
+}
+
+# Drop samples with zero total counts after filtering (common cause of downstream rarefaction failures)
+libs_tmp <- tryCatch(phyloseq::sample_sums(ps_f), error = function(e) NULL)
+if (!is.null(libs_tmp)) {
+  zero_samps <- names(libs_tmp)[libs_tmp <= 0]
+  if (length(zero_samps)) {
+    message("[filter] Dropping ", length(zero_samps), " samples with zero total counts after filtering")
+    ps_f <- prune_samples(setdiff(sample_names(ps_f), zero_samps), ps_f)
+  }
+}
+
+# Hard stop conditions (write error marker and exit 0 so snakemake can continue)
+if (nsamples(ps_f) < 2) {
+  write_error_and_quit(opt$outdir, paste0("Too few samples remain after filtering: ", nsamples(ps_f)))
+}
+if (ntaxa(ps_f) < 1) {
+  write_error_and_quit(opt$outdir, "No features remain after filtering")
+}
+
+
+# Filter breakdown summary
+n_taxa_after_iqr <- ntaxa(ps_f)
+filter_details <- data.frame(
+  stage = c("before", "after_lowcount_prevalence", "after_iqr"),
+  n_samples = c(n_samp0, n_samp0, nsamples(ps_f)),
+  n_features = c(n_taxa0, if (exists("n_taxa_after_lowcount")) n_taxa_after_lowcount else NA, n_taxa_after_iqr),
+  count_cut = opt$min_total_count,
+  prevalence = opt$prevalence,
+  iqr_remove = opt$iqr_remove,
+  stringsAsFactors = FALSE
+)
+fwrite(filter_details, file.path(qc_dir, "filter_details.tsv"), sep = "\t")
+
+n_taxaF <- ntaxa(ps_f)
+n_sampF <- nsamples(ps_f)
+
+# Save filtered tables for downstream
+feat_f <- as(otu_table(ps_f), "matrix")
+tax_f <- as(tax_table(ps_f), "matrix")
+meta_f <- as(sample_data(ps_f), "data.frame")
+
+fwrite(
+  data.frame("#NAME" = rownames(feat_f), feat_f, check.names = FALSE),
+  file.path(qc_dir, "feature_table_filtered.tsv"),
+  sep = "\t", quote = FALSE
+)
+fwrite(
+  data.frame("#TAXONOMY" = rownames(tax_f), tax_f, check.names = FALSE),
+  file.path(qc_dir, "taxonomy_filtered.tsv"),
+  sep = "\t", quote = FALSE
+)
+fwrite(
+  data.frame("#NAME" = rownames(meta_f), meta_f, check.names = FALSE),
+  file.path(qc_dir, "metadata_filtered.tsv"),
+  sep = "\t", quote = FALSE
+)
+
+qc_sum <- data.frame(
+  metric = c("n_samples", "n_features"),
+  before = c(n_samp0, n_taxa0),
+  after  = c(n_sampF, n_taxaF)
+)
+fwrite(qc_sum, file.path(qc_dir, "qc_summary.tsv"), sep = "\t")
+
+qc_long <- data.frame(
+  key = c(
+    "n_samples_before", "n_samples_after",
+    "n_features_before", "n_features_after_lowcount_prevalence", "n_features_after_iqr"
+  ),
+  value = c(
+    n_samp0, n_sampF,
+    n_taxa0,
+    if (exists("n_taxa_after_lowcount")) n_taxa_after_lowcount else NA,
+    if (exists("n_taxa_after_iqr")) n_taxa_after_iqr else n_taxaF
+  )
+)
+fwrite(qc_long, file.path(qc_dir, "qc_summary_long.tsv"), sep = "\t")
+
+# Library size plot (after filtering)
+lib <- colSums(feat_f)
+lib_df <- data.frame(sample = names(lib), libsize = as.numeric(lib), group = meta_f[[opt$group]])
+p_lib <- ggplot(lib_df, aes(x = group, y = libsize)) +
+  geom_boxplot(outlier.shape = NA) +
+  geom_jitter(width = 0.15, height = 0) +
+  labs(title = "Library size after filtering", x = opt$group, y = "Reads") +
+  theme_bw()
+ggsave(file.path(qc_dir, "libsize_boxplot.pdf"), p_lib, width = 7, height = 4)
+fwrite(lib_df, file.path(qc_dir, "libsize.tsv"), sep = "\t")
+
+# -----------------------
+# Normalization / transform
+# -----------------------
+ps_scaled <- ps_f
+scale <- tolower(opt$scale)
+if (scale == "rarefy") {
+  depth <- opt$rarefy_depth
+  if (depth <= 0) {
+    if (!is.na(opt$rarefy_q) && opt$rarefy_q > 0 && opt$rarefy_q <= 1) {
+      depth <- floor(as.numeric(stats::quantile(lib, probs = opt$rarefy_q, na.rm = TRUE)))
+    } else {
+      depth <- min(lib)
+    }
+  }
+  depth <- min(depth, min(lib, na.rm = TRUE))
+  ps_scaled <- rarefy_even_depth(ps_scaled, sample.size = depth, rngseed = opt$seed, replace = FALSE, verbose = FALSE)
+} else if (scale == "tss") {
+  otu <- as(otu_table(ps_scaled), "matrix")
+  otu <- sweep(otu, 2, colSums(otu), "/")
+  otu[is.na(otu)] <- 0
+  otu_table(ps_scaled) <- otu_table(otu, taxa_are_rows = TRUE)
+} else if (scale == "none") {
+  # do nothing
+} else {
+  stop("Unsupported --scale. Use none|tss|rarefy")
+}
+
+# Store scaled (positive) table for Bray/Jaccard
+mat_pos <- as(otu_table(ps_scaled), "matrix")
+
+# transform
+ps_final <- ps_scaled
+tr <- tolower(opt$transform)
+if (tr == "log") {
+  otu <- as(otu_table(ps_final), "matrix")
+  otu <- log(otu + opt$pseudocount)
+  otu_table(ps_final) <- otu_table(otu, taxa_are_rows = TRUE)
+} else if (tr == "clr") {
+  otu <- as(otu_table(ps_final), "matrix")
+  otu <- otu + opt$pseudocount
+  logx <- log(otu)
+  clr <- sweep(logx, 2, colMeans(logx), "-")
+  otu_table(ps_final) <- otu_table(clr, taxa_are_rows = TRUE)
+} else if (tr == "none") {
+  # do nothing
+} else {
+  stop("Unsupported --transform. Use none|log|clr")
+}
+
+# Save normalized table (final)
+feat_norm <- as(otu_table(ps_final), "matrix")
+fwrite(
+  data.frame("#NAME" = rownames(feat_norm), feat_norm, check.names = FALSE),
+  file.path(qc_dir, "feature_table_normalized.tsv"),
+  sep = "\t", quote = FALSE
+)
+
+# -----------------------
+# Alpha diversity
+# -----------------------
+alpha_ranks <- vapply(split_csv(opt$alpha_ranks), normalize_rank, character(1))
+alpha_meas <- split_csv(opt$alpha_measures)
+alpha_stats <- split_csv(opt$alpha_stats)
+
+for (rk in alpha_ranks) {
+  rk_dir <- file.path(alpha_dir, rk)
+  dir_create(rk_dir)
+
+  ps_rk <- ps_scaled
+  if (rk != "ASV") {
+    ps_rk2 <- safe_tax_glom(ps_rk, rk)
+    if (is.null(ps_rk2)) {
+      message("Skipping alpha rank (not present in taxonomy): ", rk)
+      next
+    }
+    ps_rk <- ps_rk2
+  }
+
+  # estimate_richness uses counts -> use ps_scaled
+  # TSS/CLR produce non-integer data, which will fail estimate_richness
+  # Wrap in tryCatch to skip gracefully
+  rich <- tryCatch(
+    {
+      estimate_richness(ps_rk, measures = alpha_meas)
+    },
+    error = function(e) {
+      message(
+        "Warning: Alpha diversity calculation failed for rank ", rk,
+        " (likely due to non-integer data from TSS/CLR normalization). Skipping."
+      )
+      message("Error message: ", e$message)
+      return(NULL)
+    }
+  )
+
+  if (is.null(rich)) {
+    # Write a note file explaining why alpha was skipped
+    writeLines(
+      paste0(
+        "Alpha diversity skipped for this normalization: ",
+        "estimate_richness requires integer count data, but TSS/CLR produces proportions."
+      ),
+      file.path(rk_dir, "ALPHA_SKIPPED_NOTE.txt")
+    )
+    next
+  }
+
+  rich$sample <- rownames(rich)
+  md <- as(sample_data(ps_rk), "data.frame")
+  md$sample <- rownames(md)
+  df <- left_join(rich, md, by = "sample")
+
+  fwrite(df, file.path(rk_dir, "alpha_diversity.tsv"), sep = "\t")
+
+  # plots + stats per measure
+  for (m in alpha_meas) {
+    if (!(m %in% colnames(df))) next
+    p <- ggplot(df, aes(x = .data[[opt$group]], y = .data[[m]])) +
+      geom_boxplot(outlier.shape = NA) +
+      geom_jitter(width = 0.15, height = 0) +
+      labs(title = paste0("Alpha: ", rk, " | ", m), x = opt$group, y = m) +
+      theme_bw()
+    ggsave(file.path(rk_dir, paste0("alpha_", m, ".pdf")), p, width = 7, height = 4)
+
+    res <- list()
+    g0 <- df[[opt$group]]
+    y0 <- df[[m]]
+
+    ok <- !is.na(g0) & !is.na(y0)
+    g <- factor(g0[ok])
+    y <- y0[ok]
+
+    if ("kruskal" %in% alpha_stats) {
+      if (nlevels(g) >= 2) {
+        res$kruskal <- tidy_kruskal(kruskal.test(y ~ g))
+      }
+    }
+    if ("anova" %in% alpha_stats) {
+      if (nlevels(g) >= 2) {
+        res$anova <- tidy_anova(aov(y ~ g))
+      }
+    }
+    if ("wilcoxon" %in% alpha_stats) {
+      if (nlevels(g) == 2) {
+        res$wilcoxon <- tidy_wilcox(wilcox.test(y ~ g))
+      }
+    }
+
+    # write stats
+    if (length(res) > 0) {
+      for (k in names(res)) {
+        fwrite(res[[k]], file.path(rk_dir, paste0("alpha_", m, "_", k, ".tsv")), sep = "\t")
+      }
+    }
+  }
+}
+
+# -----------------------
+# Beta diversity
+# -----------------------
+beta_ranks <- vapply(split_csv(opt$beta_ranks), normalize_rank, character(1))
+beta_dist <- tolower(split_csv(opt$beta_distances))
+beta_ord <- toupper(split_csv(opt$beta_ordinations))
+beta_stats <- tolower(split_csv(opt$beta_stats))
+
+# helper to get matrix per rank for positive (pos) and final (final)
+get_rank_mats <- function(rk) {
+  ps_pos <- ps_scaled
+  ps_fin <- ps_final
+  if (rk != "ASV") {
+    ps_pos2 <- safe_tax_glom(ps_pos, rk)
+    ps_fin2 <- safe_tax_glom(ps_fin, rk)
+    if (is.null(ps_pos2) || is.null(ps_fin2)) {
+      return(NULL)
+    }
+    ps_pos <- ps_pos2
+    ps_fin <- ps_fin2
+  }
+  list(
+    pos = t(as(otu_table(ps_pos), "matrix")), # samples x features
+    fin = t(as(otu_table(ps_fin), "matrix")), # samples x features
+    meta = as(sample_data(ps_pos), "data.frame")
+  )
+}
+
+for (rk in beta_ranks) {
+  rk_dir <- file.path(beta_dir, rk)
+  dir_create(rk_dir)
+
+  mats <- get_rank_mats(rk)
+  if (is.null(mats)) {
+    message("Skipping beta rank (not present in taxonomy): ", rk)
+    next
+  }
+  md <- mats$meta
+  grp <- factor(md[[opt$group]])
+
+  for (d in beta_dist) {
+    x <- if (d %in% c("bray", "jaccard")) mats$pos else mats$fin
+    dist <- vegan::vegdist(x, method = d)
+
+    # stats
+    if ("permanova" %in% beta_stats) {
+      ad <- vegan::adonis2(dist ~ grp, permutations = opt$permutations)
+      fwrite(as.data.frame(ad), file.path(rk_dir, paste0("beta_", d, "_permanova.tsv")), sep = "\t")
+    }
+    if ("anosim" %in% beta_stats) {
+      # ANOSIM
+      an <- tryCatch(
+        {
+          vegan::anosim(dist, grp, permutations = opt$permutations)
+        },
+        error = function(e) {
+          message("Skipping ANOSIM due to error: ", e$message)
+          return(NULL)
+        }
+      )
+      if (!is.null(an)) {
+        fwrite(data.frame(statistic = an$statistic, signif = an$signif, permutations = an$permutations),
+          file.path(rk_dir, paste0("beta_", d, "_anosim.tsv")),
+          sep = "\t"
+        )
+      }
+    }
+
+    # ordinations
+    for (ord in beta_ord) {
+      ord_dir <- file.path(rk_dir, paste0(d, "_", ord))
+      dir_create(ord_dir)
+
+      if (ord == "PCOA") {
+        co <- cmdscale(dist, k = 2, eig = TRUE)
+        df <- data.frame(sample = rownames(co$points), PC1 = co$points[, 1], PC2 = co$points[, 2])
+      } else if (ord == "NMDS") {
+        nmds <- vegan::metaMDS(dist, k = 2, trymax = 50, autotransform = FALSE, trace = FALSE)
+        df <- data.frame(sample = rownames(nmds$points), NMDS1 = nmds$points[, 1], NMDS2 = nmds$points[, 2])
+      } else {
+        next
+      }
+
+      df <- left_join(df, md %>% mutate(sample = rownames(md)), by = "sample")
+      fwrite(df, file.path(ord_dir, "ordination_points.tsv"), sep = "\t")
+
+      x1 <- colnames(df)[2]
+      x2 <- colnames(df)[3]
+      p <- ggplot(df, aes(x = .data[[x1]], y = .data[[x2]], color = .data[[opt$group]])) +
+        geom_point(size = 2, alpha = 0.9) +
+        labs(title = paste0("Beta: ", rk, " | ", d, " | ", ord), color = opt$group) +
+        theme_bw()
+      ggsave(file.path(ord_dir, "ordination.pdf"), p, width = 6, height = 5)
+    }
+  }
+}
+
+# -----------------------
+# Composition (stacked bar, top taxa)
+# -----------------------
+comp_ranks <- unique(c("Kingdom", "Phylum", "Class", "Order", "Family", "Genus", "Species"))
+for (rk in comp_ranks) {
+  rk_dir <- file.path(comp_dir, rk)
+  dir_create(rk_dir)
+  ps_rk <- safe_tax_glom(ps_scaled, rk)
+  if (is.null(ps_rk)) {
+    message("Skipping composition rank (not present in taxonomy): ", rk)
+    next
+  }
+  otu <- as(otu_table(ps_rk), "matrix")
+  otu_rel <- sweep(otu, 2, colSums(otu), "/")
+  otu_rel[is.na(otu_rel)] <- 0
+
+  taxm <- as(tax_table(ps_rk), "matrix")
+  taxa_label <- as.character(taxm[, rk])
+  taxa_label[is.na(taxa_label) | taxa_label == ""] <- "Unassigned"
+  rownames(otu_rel) <- make.unique(taxa_label)
+
+  # top 20 taxa overall
+  topN <- 20
+  totals <- rowSums(otu_rel)
+  top_taxa <- names(sort(totals, decreasing = TRUE))[seq_len(min(topN, length(totals)))]
+  other <- setdiff(rownames(otu_rel), top_taxa)
+
+  otu_rel2 <- otu_rel
+  if (length(other) > 0) {
+    other_row <- colSums(otu_rel2[other, , drop = FALSE])
+    otu_rel2 <- otu_rel2[top_taxa, , drop = FALSE]
+    otu_rel2 <- rbind(otu_rel2, Other = other_row)
+  }
+
+  # Long format dataframe for sample-level plots
+  df <- as.data.frame(otu_rel2) %>%
+    {
+      data.frame(Taxon = rownames(.), ., check.names = FALSE)
+    } %>%
+    pivot_longer(-Taxon, names_to = "sample", values_to = "abundance") %>%
+    left_join(as(sample_data(ps_scaled), "data.frame") %>% mutate(sample = rownames(.)), by = "sample")
+
+  fwrite(df, file.path(rk_dir, "composition_long.tsv"), sep = "\t")
+
+  # 1) Sample-level stacked bar (original, renamed)
+  p_sample <- ggplot(df, aes(x = sample, y = abundance, fill = Taxon)) +
     geom_col(width = 0.9) +
-    theme_bw(12) +
-    labs(title = sprintf("Taxonomic composition (Group mean) • %s", rk),
-         x = "Group", y = "Mean relative abundance")
-  
-  fn2 <- file.path(outdir, sprintf("taxa_bar_SamGrpBars_groupmean_%s.png", tolower(rk)))
-  ggsave(fn2, p_grp, width = 9, height = 5, dpi = 200)
-  ggsave(sub("\\.png$", ".pdf", fn2), p_grp, width = 9, height = 5)
-  
-  invisible(list(sample_plot = fn1, group_plot = fn2))
+    facet_grid(~ .data[[opt$group]], scales = "free_x", space = "free_x") +
+    theme_bw() +
+    theme(axis.text.x = element_text(angle = 90, vjust = 0.5, hjust = 1), panel.spacing = unit(0.2, "lines")) +
+    labs(title = paste0("Composition by Sample: ", rk), x = "Sample", y = "Relative abundance")
+  ggsave(file.path(rk_dir, "stacked_bar_by_sample.pdf"), p_sample, width = 12, height = 4)
+
+  # 2) Group-averaged stacked bar
+  df_group <- df %>%
+    group_by(.data[[opt$group]], Taxon) %>%
+    summarise(abundance = mean(abundance, na.rm = TRUE), .groups = "drop")
+
+  # Order taxa by total abundance for consistent stacking
+  taxa_order <- df_group %>%
+    group_by(Taxon) %>%
+    summarise(total = sum(abundance)) %>%
+    arrange(desc(total)) %>%
+    pull(Taxon)
+  df_group$Taxon <- factor(df_group$Taxon, levels = rev(taxa_order))
+
+  p_group <- ggplot(df_group, aes(x = .data[[opt$group]], y = abundance, fill = Taxon)) +
+    geom_col(width = 0.7) +
+    theme_bw() +
+    theme(axis.text.x = element_text(angle = 45, vjust = 1, hjust = 1)) +
+    labs(title = paste0("Mean Composition by Group: ", rk), x = opt$group, y = "Relative abundance")
+  ggsave(file.path(rk_dir, "stacked_bar_by_group.pdf"), p_group, width = 8, height = 5)
+
+  # Save group-level summary table
+  df_group_wide <- df_group %>%
+    pivot_wider(names_from = Taxon, values_from = abundance, values_fill = 0)
+  fwrite(df_group_wide, file.path(rk_dir, "composition_by_group.tsv"), sep = "\t")
+
+  # 3) Area plot by group (for visualizing composition trends)
+  # Reorder for area plot
+  df_group_area <- df_group
+  df_group_area$Taxon <- factor(df_group_area$Taxon, levels = taxa_order)
+
+  p_area <- ggplot(df_group_area, aes(x = .data[[opt$group]], y = abundance, fill = Taxon, group = Taxon)) +
+    geom_area(position = "stack", alpha = 0.85) +
+    theme_bw() +
+    theme(axis.text.x = element_text(angle = 45, vjust = 1, hjust = 1)) +
+    labs(title = paste0("Composition Area Plot: ", rk), x = opt$group, y = "Relative abundance")
+  ggsave(file.path(rk_dir, "area_plot_by_group.pdf"), p_area, width = 8, height = 5)
 }
 
-withr::with_dir(dir_comp_samgrp, {
-  ranks_all <- c("Kingdom","Phylum","Class","Order","Family","Genus","Species")
-  for (rk in ranks_all) {
-    message(">> SamGrpBars ggplot: ", rk)
-    try(make_samgrp_plots_one_rank(ps, rk, grp, getwd(), topN = 10), silent = TRUE)
-  }
-})
-
-# ---- C) 모든 rank에 대해 proportion 테이블 저장 (long / wide / 그룹평균 / 그룹중앙값 / 총합) ----
-dir_props <- file.path(dir_comp, "props")
-dir.create(dir_props, showWarnings = FALSE, recursive = TRUE)
-
-.clean_taxon <- function(x, rk) {
-  x <- as.character(x)
-  x[is.na(x) | x == "" | x == "NA"] <- paste0("Unclassified_", rk)
-  x
-}
-
-save_rank_props <- function(ps, rk, grp, meta_df, outdir) {
-  if (!(rk %in% colnames(tax_table(ps)))) {
-    message("Skip props (rank missing): ", rk)
-    return(invisible(NULL))
-  }
-  ps_rk  <- suppressWarnings(tax_glom(ps, taxrank = rk, NArm = TRUE))
-  ps_rel <- transform_sample_counts(ps_rk, function(x) if (sum(x) == 0) x else x / sum(x))
-  
-  # long: Sample, Group, Taxon, Abundance
-  df_long <- psmelt(ps_rel) |>
-    dplyr::select(Sample, all_of(grp), Abundance, all_of(rk)) |>
-    dplyr::rename(Group = !!sym(grp), Taxon = !!sym(rk)) |>
-    dplyr::mutate(Taxon = .clean_taxon(Taxon, rk)) |>
-    dplyr::arrange(Sample, Taxon)
-  
-  readr::write_tsv(df_long, file.path(outdir, sprintf("%s_long.tsv", tolower(rk))))
-  
-  # wide: Sample × Taxon (+Group)
-  df_wide <- df_long |>
-    dplyr::group_by(Sample, Taxon) |>
-    dplyr::summarise(Abundance = sum(Abundance), .groups = "drop") |>
-    tidyr::pivot_wider(names_from = Taxon, values_from = Abundance, values_fill = 0) |>
-    dplyr::left_join(
-      meta_df |>
-        tibble::rownames_to_column("Sample") |>
-        dplyr::select(Sample, all_of(grp)) |>
-        dplyr::rename(Group = !!sym(grp)),
-      by = "Sample"
-    ) |>
-    dplyr::relocate(Group, .after = Sample)
-  
-  readr::write_tsv(df_wide, file.path(outdir, sprintf("%s_wide_samplexTaxon.tsv", tolower(rk))))
-  
-  # 그룹 평균/중앙값
-  df_group_mean <- df_long |>
-    dplyr::group_by(Group, Taxon) |>
-    dplyr::summarise(mean_prop = mean(Abundance, na.rm = TRUE), .groups = "drop") |>
-    tidyr::pivot_wider(names_from = Taxon, values_from = mean_prop, values_fill = 0) |>
-    dplyr::arrange(Group)
-  
-  df_group_median <- df_long |>
-    dplyr::group_by(Group, Taxon) |>
-    dplyr::summarise(median_prop = median(Abundance, na.rm = TRUE), .groups = "drop") |>
-    tidyr::pivot_wider(names_from = Taxon, values_from = median_prop, values_fill = 0) |>
-    dplyr::arrange(Group)
-  
-  readr::write_tsv(df_group_mean,   file.path(outdir, sprintf("%s_group_mean.tsv",   tolower(rk))))
-  readr::write_tsv(df_group_median, file.path(outdir, sprintf("%s_group_median.tsv", tolower(rk))))
-  
-  # 전체 합 기준 상위 taxa
-  df_totals <- df_long |>
-    dplyr::group_by(Taxon) |>
-    dplyr::summarise(total_prop = sum(Abundance), .groups = "drop") |>
-    dplyr::arrange(dplyr::desc(total_prop))
-  
-  readr::write_tsv(df_totals, file.path(outdir, sprintf("%s_taxa_totals.tsv", tolower(rk))))
-}
-
-ranks_to_save <- c("Kingdom","Phylum","Class","Order","Family","Genus","Species")
-for (rk in ranks_to_save) {
-  message("Saving proportions for rank: ", rk)
-  save_rank_props(ps, rk, grp, meta_df, dir_props)
-}
-
-
-
-cat("== Done ==\nOutput root: ", outdir,
-    "\nSubfolders:\n  - 00_QC_Normalization\n  - 01_Alpha\n  - 02_Beta\n  - 03_Composition\n", sep="")
+message("DONE: ", outdir)

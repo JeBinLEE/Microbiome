@@ -1,5 +1,7 @@
 #!/usr/bin/env Rscript
+.libPaths("/home/ljb/R/x86_64-pc-linux-gnu-library/4.4")
 
+#.libPaths("/home/mysns/miniconda3/envs/microbiome-ma/lib/R/library")
 suppressPackageStartupMessages({
   library(readr); library(dplyr); library(tibble); library(stringr)
   library(ggplot2); library(ggprism); library(ggpicrust2) ;library(rlang)
@@ -14,6 +16,12 @@ ko_unstrat_tsv <- args[1]
 metadata_path  <- args[2]
 group_col      <- args[3]
 out_dir        <- args[4]
+
+# ko_unstrat_tsv <- "~/microbiome/Microbiome/GutBiomeTech/vsearch_results/picrust2/picrust2_data/KO_unstrat.tsv"
+# metadata_path  <- "~/microbiome/Microbiome/GutBiomeTech/MicrobiomeAnalyst/upload/metadata_for_MA.txt"
+# group_col      <- "Group1"
+# out_dir        <- args[4]
+
 top_n_per_class <- ifelse(length(args) >= 5, as.integer(args[5]), 5)
 dir.create(out_dir, recursive = TRUE, showWarnings = FALSE)
 
@@ -24,9 +32,11 @@ message("[picrust] out_dir   : ", out_dir)
 
 ## ---------- utils ----------
 make_placeholder_pdf <- function(fp, msg = "No pathways to display") {
-  g <- ggplot() + annotate("text", x=0, y=0, label=msg, size=6) +
-    xlim(-1,1) + ylim(-1,1) + theme_void()
-  ggsave(fp, g, width=6, height=3, device=cairo_pdf)
+  # Use base pdf device (available on almost all servers); avoid cairo_pdf dependency.
+  grDevices::pdf(fp, width = 7, height = 3)
+  graphics::plot.new()
+  graphics::text(0.5, 0.5, msg, cex = 1.2)
+  grDevices::dev.off()
 }
 
 sanitize_ko_unstrat <- function(path_in) {
@@ -77,6 +87,11 @@ sanitize_ko_unstrat <- function(path_in) {
   return(tmp)
 }
 
+# -------------------------------
+# main wrapper: never fail snakemake
+# -------------------------------
+main <- function() {
+
 ## ---------- 1) 입력 로드 ----------
 metadata <- read_delim(metadata_path, delim = "\t", show_col_types = FALSE)
 stopifnot("Sample" %in% names(metadata))
@@ -94,42 +109,131 @@ metadata <- metadata |>
   dplyr::slice(match(colnames(kegg_abundance), Sample))
 
 ## ---------- 2) DAA & annotation ----------
-daa_kegg <- pathway_daa(kegg_abundance, metadata, group = group_col, daa_method = "ALDEx2")
-daa_kegg_kw <- daa_kegg |> dplyr::filter(grepl("Kruskal|KW|kruskal", .data$method, ignore.case = TRUE))
-daa_kegg_annot <- pathway_annotation(pathway = "KO", daa_results_df = daa_kegg_kw, ko_to_kegg = TRUE)
+## ---------- 2) DAA & annotation ----------
+daa_kegg <- tryCatch({
+pathway_daa(
+  kegg_abundance,
+  metadata,
+  group      = group_col,
+  daa_method = "ALDEx2"
+)
+}, error = function(e) {
+  msg <- paste0('pathway_daa failed: ', conditionMessage(e))
+  message(msg)
+  writeLines(msg, file.path(out_dir, 'pathway_daa_ERROR.txt'))
+  make_placeholder_pdf(file.path(out_dir, 'errorbar_all.pdf'), msg)
+  make_placeholder_pdf(file.path(out_dir, 'errorbar_by_class.pdf'), msg)
+  quit(save = 'no', status = 0)
+})
 
-# 유효 class만
+daa_kegg_kw <- daa_kegg |>
+  dplyr::filter(grepl("Kruskal|KW|kruskal|ALDEx2", .data$method, ignore.case = TRUE))
+
+# If multiple methods remain (e.g. ALDEx2 returns Welch and Wilcoxon), pick the first one
+if (nrow(daa_kegg_kw) > 0) {
+  methods_found <- unique(daa_kegg_kw$method)
+  if (length(methods_found) > 1) {
+    chosen <- methods_found[1]
+    message("[picrust] Multiple methods found: ", paste(methods_found, collapse=", "), ". Using: ", chosen)
+    daa_kegg_kw <- daa_kegg_kw |> dplyr::filter(method == chosen)
+  }
+}
+
+## (1) DAA 결과가 아예 없으면 → 더미 pdf 만들고 정상 종료
+if (is.null(daa_kegg_kw) || nrow(daa_kegg_kw) == 0) {
+  message("No KEGG pathways from pathway_daa (ALDEx2/Kruskal). Skipping KEGG class plot.")
+  
+  # 디버깅용 원본도 남겨두기
+  readr::write_tsv(daa_kegg,    file.path(out_dir, "daa_kegg_raw.tsv"))
+  readr::write_tsv(daa_kegg_kw, file.path(out_dir, "daa_kegg_kruskal.tsv"))
+  
+  make_placeholder_pdf(
+    file.path(out_dir, "errorbar_all.pdf"),
+    "No KEGG pathways from ALDEx2/Kruskal"
+  )
+  make_placeholder_pdf(
+    file.path(out_dir, "errorbar_by_class.pdf"),
+    "No KEGG pathways from ALDEx2/Kruskal"
+  )
+  
+  quit(save = "no", status = 0)
+}
+
+## (2) KEGG annotation
+daa_kegg_annot <- pathway_annotation(
+  pathway        = "KO",
+  daa_results_df = daa_kegg_kw,
+  ko_to_kegg     = TRUE
+)
+
+## annotation= 0 → dummi  pdf create
+if (is.null(daa_kegg_annot) || nrow(daa_kegg_annot) == 0) {
+  message("KEGG annotation returned 0 rows. Skipping KEGG class plot.")
+  
+  readr::write_tsv(daa_kegg,    file.path(out_dir, "daa_kegg_raw.tsv"))
+  readr::write_tsv(daa_kegg_kw, file.path(out_dir, "daa_kegg_kruskal.tsv"))
+  
+  make_placeholder_pdf(
+    file.path(out_dir, "errorbar_all.pdf"),
+    "No KEGG annotation rows"
+  )
+  make_placeholder_pdf(
+    file.path(out_dir, "errorbar_by_class.pdf"),
+    "No KEGG annotation rows"
+  )
+  
+  quit(save = "no", status = 0)
+}
+
+## (3) pathway_class 처리
+if (!("pathway_class" %in% names(daa_kegg_annot))) {
+  daa_kegg_annot$pathway_class <- NA_character_
+}
+
 naa <- is.na(daa_kegg_annot$pathway_class)
-if (any(naa)) {
+if (all(naa)) {
+  message("All pathways have NA class. Setting pathway_class = 'Unknown'.")
+  daa_kegg_annot$pathway_class <- "Unknown"
+} else if (any(naa)) {
   message("[ggpicrust2] drop ", sum(naa), " rows with NA class.")
   daa_kegg_annot <- daa_kegg_annot[!naa, , drop = FALSE]
 }
 
-# 효과크기 통일: effect_size 생성
-eff_candidates <- c("effect","diff.btw","diff.between","logFC","cohen_d","AUC","stat","W")
+## (4) 여기까지 왔으면 최소 1행 보장 → effect_size 추가해도 안전
+eff_candidates <- c(
+  "effect", "diff.btw", "diff.between",
+  "logFC", "cohen_d", "AUC", "stat", "W"
+)
 hit <- eff_candidates[eff_candidates %in% names(daa_kegg_annot)]
 daa_kegg_annot$effect_size <- NA_real_
 if (length(hit)) {
-  daa_kegg_annot$effect_size <- suppressWarnings(as.numeric(daa_kegg_annot[[hit[1]]]))
+  daa_kegg_annot$effect_size <- suppressWarnings(
+    as.numeric(daa_kegg_annot[[hit[1]]])
+  )
 }
 
-## ---------- 2.1) 소스 데이터 저장 ----------
+## ---------- 2.1) save source data----------
 readr::write_tsv(
-  tibble::as_tibble(tibble::rownames_to_column(as.data.frame(kegg_abundance), "feature")),
+  tibble::as_tibble(
+    tibble::rownames_to_column(as.data.frame(kegg_abundance), "feature")
+  ),
   file.path(out_dir, "errorbar_by_class_source.tsv")
 )
-readr::write_tsv(daa_kegg,        file.path(out_dir, "daa_kegg_raw.tsv"))
-readr::write_tsv(daa_kegg_kw,     file.path(out_dir, "daa_kegg_kruskal.tsv"))
-readr::write_tsv(daa_kegg_annot,  file.path(out_dir, "daa_kegg_annotated.tsv"))
+readr::write_tsv(daa_kegg,       file.path(out_dir, "daa_kegg_raw.tsv"))
+readr::write_tsv(daa_kegg_kw,    file.path(out_dir, "daa_kegg_kruskal.tsv"))
+readr::write_tsv(daa_kegg_annot, file.path(out_dir, "daa_kegg_annotated.tsv"))
 
 top_terms <- daa_kegg_annot |>
-  dplyr::filter(!is.na(pathway_class)) |>
   dplyr::group_by(pathway_class) |>
   dplyr::arrange(p_adjust, .by_group = TRUE) |>
   dplyr::slice_head(n = top_n_per_class) |>
   dplyr::ungroup() |>
   dplyr::select(pathway_class, feature, pathway_name, p_adjust, effect_size)
-readr::write_tsv(top_terms, file.path(out_dir, "errorbar_by_class_top_terms.tsv"))
+
+readr::write_tsv(
+  top_terms,
+  file.path(out_dir, "errorbar_by_class_top_terms.tsv")
+)
 
 ## ---------- 3) 플로팅 ----------
 has_rows <- nrow(daa_kegg_annot) > 0
@@ -149,7 +253,7 @@ if (has_rows) {
     x_lab              = "pathway_name"
   )
   ggsave(file.path(out_dir, "errorbar_all.pdf"), p_all,
-         width = 12, height = 15, units = "in", device = cairo_pdf)
+         width = 12, height = 15, units = "in", device = "pdf")
 } else {
   make_placeholder_pdf(file.path(out_dir, "errorbar_all.pdf"),
                        "No significant pathways (global)")
@@ -187,7 +291,7 @@ if (has_rows) {
     plot_list[[cls]] <- p
     ggsave(file.path(out_dir, paste0("errorbar_", gsub("[^A-Za-z0-9]+","_", cls), ".pdf")),
            p, width = 12, height = max(6, 0.42 * length(sel_features)),
-           units = "in", device = cairo_pdf)
+           units = "in", device = "pdf")
   }
 }
 
@@ -201,3 +305,18 @@ if (length(plot_list)) {
 }
 
 message("[OK] PICRUSt2 KEGG plots exported to: ", out_dir)
+}
+
+tryCatch(
+  main(),
+  error = function(e) {
+    msg <- paste0("[ERROR] plot_kegg_by_class.R failed: ", conditionMessage(e))
+    message(msg)
+    dir.create(out_dir, recursive = TRUE, showWarnings = FALSE)
+    writeLines(msg, file.path(out_dir, "PLOT_KEGG_ERROR.txt"))
+    make_placeholder_pdf(file.path(out_dir, "errorbar_all.pdf"), msg)
+    make_placeholder_pdf(file.path(out_dir, "errorbar_by_class.pdf"), msg)
+    quit(save = "no", status = 0)
+  }
+)
+

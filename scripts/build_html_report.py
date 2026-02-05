@@ -57,7 +57,7 @@ IMG_EXT = (".png", ".jpg", ".jpeg", ".gif", ".svg")
 PDF_EXT = (".pdf",)
 
 # MA_OUTDIR 표준 경로
-TAX_LEVELS = ["phylum","class","order","family","genus","species"]
+TAX_LEVELS = ["kingdom","phylum","class","order","family","genus","species"]
 ALPHA_TSV = "01_Alpha/alpha_values.tsv"
 BETA_MAIN_PAT = "02_Beta/perma*bray_all.tsv"
 BETA_PAIR = "02_Beta/pairwise_permanova_bray.tsv"
@@ -368,29 +368,115 @@ def build_site(ma_outdir, ma_fig_dir, lefse_csv, lefse_dir, pic_plot_dir, outdir
                    breadcrumbs_html=f'Home / Composition / Sample / {lvl.capitalize()}',
                    inner_html=html)
 
-    # ---------- Alpha ----------
-    mapped_alpha_imgs = materialize(alpha_imgs, assets / "alpha/imgs", mode)
+    # ---------- Alpha (hierarchical: Rank -> Measure) ----------
     page_dir_alpha = outdir / "alpha"
-    hrefs_alpha = rels_from(page_dir_alpha, mapped_alpha_imgs)
     alpha_data_mapped = materialize([alpha_tsv], assets / "alpha/data", mode) if alpha_tsv.exists() else []
+
+    # Parse Alpha files: 01_Alpha__{Rank}__alpha_{Measure}.pdf
+    alpha_hierarchy = defaultdict(lambda: defaultdict(list))  # rank -> measure -> files
+    for p in alpha_imgs:
+        name = Path(p).stem
+        # Pattern: 01_Alpha__Family__alpha_Chao1
+        if "__" in name and "Alpha" in name:
+            parts = name.split("__")
+            if len(parts) >= 3:
+                rank = parts[1]  # Family
+                measure_part = parts[2]  # alpha_Chao1
+                measure = measure_part.replace("alpha_", "") if measure_part.startswith("alpha_") else measure_part
+                alpha_hierarchy[rank][measure].append(p)
+            else:
+                alpha_hierarchy["Other"]["Other"].append(p)
+        else:
+            alpha_hierarchy["Other"]["Other"].append(p)
+
+    # Create Alpha index page with rank links
+    rank_items = [(rk.capitalize(), f"{rk}/index.html", len(msrs)) for rk, msrs in alpha_hierarchy.items() if rk != "Other"]
     write_html(outdir/"alpha/index.html", "Alpha diversity", root_href="../",
                breadcrumbs_html='Home / Alpha diversity',
-               inner_html=gallery("Alpha diversity plots", page_dir_alpha, hrefs_alpha, with_source_links=False) +
+               inner_html=make_list_page("Choose Taxonomic Rank", rank_items) +
                           data_card("Data sources", page_dir_alpha, alpha_data_mapped))
 
-    # ---------- Beta ----------
-    mapped_beta_imgs = materialize(beta_imgs, assets / "beta/imgs", mode)
+    # Create rank-level pages with measure links
+    for rank, measures in alpha_hierarchy.items():
+        if rank == "Other" and not measures:
+            continue
+        rank_dir = outdir / "alpha" / rank
+        measure_items = [(m.capitalize(), f"{m}.html", len(fs)) for m, fs in measures.items()]
+        write_html(rank_dir / "index.html", f"Alpha • {rank}", root_href="../../",
+                   breadcrumbs_html=f'Home / Alpha diversity / {rank}',
+                   inner_html=make_list_page("Choose Measure", measure_items))
+
+        # Create measure-level leaf pages
+        for measure, files in measures.items():
+            mapped = materialize(files, assets / f"alpha/{rank}/{measure}", mode)
+            hrefs = rels_from(rank_dir, mapped)
+            write_html(rank_dir / f"{measure}.html", f"Alpha • {rank} • {measure}", root_href="../../",
+                       breadcrumbs_html=f'Home / Alpha diversity / {rank} / {measure}',
+                       inner_html=gallery(f"{measure}", rank_dir, hrefs, with_source_links=False))
+
+    # ---------- Beta (hierarchical: Rank -> Distance -> Ordination) ----------
     page_dir_beta = outdir / "beta"
-    hrefs_beta = rels_from(page_dir_beta, mapped_beta_imgs)
     beta_data = []
     beta_data += beta_main
     if beta_pair.exists(): beta_data.append(beta_pair)
     if beta_pcoa.exists(): beta_data.append(beta_pcoa)
     mapped_beta_data = materialize(beta_data, assets / "beta/data", mode) if beta_data else []
+
+    # Parse Beta files: 02_Beta__{Rank}__{dist}_{ord}__ordination.pdf
+    beta_hierarchy = defaultdict(lambda: defaultdict(lambda: defaultdict(list)))  # rank -> dist -> ord -> files
+    for p in beta_imgs:
+        name = Path(p).stem
+        # Pattern: 02_Beta__Family__bray_NMDS__ordination
+        if "__" in name and "Beta" in name:
+            parts = name.split("__")
+            if len(parts) >= 3:
+                rank = parts[1]  # Family
+                dist_ord = parts[2]  # bray_NMDS
+                dist_ord_parts = dist_ord.split("_")
+                if len(dist_ord_parts) >= 2:
+                    dist = dist_ord_parts[0]  # bray
+                    ords = dist_ord_parts[1]  # NMDS
+                    beta_hierarchy[rank][dist][ords].append(p)
+                else:
+                    beta_hierarchy[rank]["Other"]["Other"].append(p)
+            else:
+                beta_hierarchy["Other"]["Other"]["Other"].append(p)
+        else:
+            beta_hierarchy["Other"]["Other"]["Other"].append(p)
+
+    # Create Beta index page with rank links
+    rank_items = [(rk.capitalize(), f"{rk}/index.html", sum(len(ords) for ords in dists.values())) 
+                  for rk, dists in beta_hierarchy.items() if rk != "Other"]
     write_html(outdir/"beta/index.html", "Beta diversity", root_href="../",
                breadcrumbs_html='Home / Beta diversity',
-               inner_html=gallery("Beta diversity plots", page_dir_beta, hrefs_beta, with_source_links=False) +
+               inner_html=make_list_page("Choose Taxonomic Rank", rank_items) +
                           data_card("Data sources", page_dir_beta, mapped_beta_data))
+
+    # Create rank-level pages with distance links
+    for rank, dists in beta_hierarchy.items():
+        if rank == "Other" and not dists:
+            continue
+        rank_dir = outdir / "beta" / rank
+        dist_items = [(d.capitalize(), f"{d}/index.html", len(ords)) for d, ords in dists.items()]
+        write_html(rank_dir / "index.html", f"Beta • {rank}", root_href="../../",
+                   breadcrumbs_html=f'Home / Beta diversity / {rank}',
+                   inner_html=make_list_page("Choose Distance", dist_items))
+
+        # Create distance-level pages with ordination links
+        for dist, ords in dists.items():
+            dist_dir = rank_dir / dist
+            ord_items = [(o.upper(), f"{o}.html", len(fs)) for o, fs in ords.items()]
+            write_html(dist_dir / "index.html", f"Beta • {rank} • {dist}", root_href="../../../",
+                       breadcrumbs_html=f'Home / Beta diversity / {rank} / {dist}',
+                       inner_html=make_list_page("Choose Ordination", ord_items))
+
+            # Create ordination-level leaf pages
+            for ord_name, files in ords.items():
+                mapped = materialize(files, assets / f"beta/{rank}/{dist}/{ord_name}", mode)
+                hrefs = rels_from(dist_dir, mapped)
+                write_html(dist_dir / f"{ord_name}.html", f"Beta • {rank} • {dist} • {ord_name}", root_href="../../../",
+                           breadcrumbs_html=f'Home / Beta diversity / {rank} / {dist} / {ord_name}',
+                           inner_html=gallery(f"{ord_name}", dist_dir, hrefs, with_source_links=False))
 
     # ---------- LEfSe (이전 스타일) ----------
     page_dir_lefse = outdir / "lefse"; os.makedirs(page_dir_lefse, exist_ok=True)

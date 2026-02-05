@@ -25,31 +25,36 @@ else echo "ERROR: taxonomy 소스 없음: $TAX1 또는 $TAX2" >&2; exit 1; fi
 awk -F '\t' '
   BEGIN{OFS="\t"; hdr=0}
   {
-    sub(/\r$/,"")                       # CR 제거
-    # 빈 줄/코멘트 프리앰블은 스킵(단, #OTU ID는 실제 헤더일 수 있으니 제외)
+    sub(/\r$/,"")                       
     if (!hdr && $0 ~ /^[[:space:]]*#/ && $1!="#OTU ID") next
-    # 실제 헤더 탐지
     if (!hdr && ($1=="Feature ID" || $1=="FeatureID" || $1=="#OTU ID" || $1=="OTU ID")) {
       $1="#NAME"; hdr=1; print; next
     }
-    # 헤더 이후 본문
     if (hdr) { print }
   }
 ' "$FT" > "$UP/feature_table_for_MA.txt"
 
-# 2) metadata → #NAME, Sample, Group1 (manifest 1열만 사용)
-#    Group1 = sample-id에서 첫 숫자부터 끝까지 제거 (예: C01_S10 -> C)
+# 2) metadata → #NAME, Sample, Group1 (manifest 1열)
+# GROUP_CHARS: Number of characters from sample ID to use for grouping (default: 1)
+GROUP_CHARS="${GROUP_CHARS:-1}"
+
 {
   echo "#NAME	Sample	Group1"
-  awk '
+  awk -v grp_chars="$GROUP_CHARS" '
     BEGIN{ OFS="\t" }
-    NR==1 { next }                             # manifest 헤더 스킵
+    NR==1 { next }                             # manifest header
     {
       line=$0; sub(/\r$/,"",line)
-      n=split(line, a, /[ \t]+/); id=a[1]      # 탭/공백 모두 허용
+      n=split(line, a, /[ \t]+/); id=a[1]      
       if (id=="" || tolower(id)=="sample-id") next
-      grp=id; sub(/[0-9].*$/, "", grp)
+
+      if (length(id) >= grp_chars) {
+        grp = substr(id, 1, grp_chars)
+      } else {
+        grp = id
+      }
       if (grp=="") grp="G1"
+
       print id, id, grp
     }
   ' "$MAN"
@@ -98,7 +103,7 @@ NR==1{
   for(i=1;i<=NF;i++){ if($i=="Feature ID"||$i=="FeatureID") fi=i }
   for(i=1;i<=NF;i++){ if($i=="Taxon"||$i=="taxonomy"||$i=="Classification"||$i=="Consensus") ti=i }
   if(!fi||!ti){print "ERROR: need FeatureID & Taxon columns" > "/dev/stderr"; exit 1}
-  print "#TAXONOMY","Phylum","Class","Order","Family","Genus","Species"
+  print "#TAXONOMY","Kingdom","Phylum","Class","Order","Family","Genus","Species"
   next
 }
 {
@@ -106,16 +111,11 @@ NR==1{
   sub(/^[ \t]+/,"",tax); sub(/[ \t]+$/,"",tax)
   n=split(tax,a,/;[ ]*/)
 
-  # Kingdom 같은 첫 토큰은 건너뛰기
-  s=1
-  if (n>=2 && (a[1] ~ /^k__/ || tolower(a[1])=="kingdom" || a[1] ~ /^d__/ || tolower(a[1])=="superkingdom")) s=2
-
-  for(i=1;i<=6;i++) out[i]=""
-  for(i=1;i<=6;i++){
-    j=s+i-1
-    if (j<=n) out[i]=a[j]
+  for(i=1;i<=7;i++) out[i]=""
+  for(i=1;i<=7;i++){
+    if (i<=n) out[i]=a[i]
   }
-  print fid,out[1],out[2],out[3],out[4],out[5],out[6]
+  print fid,out[1],out[2],out[3],out[4],out[5],out[6],out[7]
 }
 ' "$TAX_SRC" > "$UP/taxonomy_for_MA.txt"
 

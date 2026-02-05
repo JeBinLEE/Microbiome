@@ -16,6 +16,63 @@ rarefy_q: 0.00
 p_cut: 0.1
 count_cut: 4
 
+# ====================================================================
+# Normalization sweeps by analysis type
+# - Alpha/Beta diversity: Rarefy 40,000
+# - Stacked Bar/Area Plot, LEfSe: TSS (Total Sum Scaling)
+# - Heatmap, Correlation: CLR (Centered Log Ratio)
+# - PICRUSt: raw count (rarefied data is handled separately)
+# ====================================================================
+sweeps:
+  primary_norm: "01_AlphaBeta_Rarefy40k"  # Default normalization for main results
+  normalizations:
+    # Alpha/Beta diversity: Rarefy to 40,000 reads
+    - id: "01_AlphaBeta_Rarefy40k"
+      scale: "rarefy"
+      rarefy_depth: 40000
+      rarefy_q: 0.0
+      transform: "none"
+      pseudocount: 1
+      description: "For Alpha/Beta diversity analysis"
+
+    # Stacked Bar/Area Plot, LEfSe: TSS (relative abundance)
+    - id: "02_Composition_TSS"
+      scale: "tss"
+      rarefy_depth: 0
+      rarefy_q: 0.0
+      transform: "none"
+      pseudocount: 1
+      description: "For Stacked Bar, Area Plot, LEfSe"
+
+    # Heatmap, Correlation: CLR transformation
+    - id: "03_Heatmap_CLR"
+      scale: "none"
+      rarefy_depth: 0
+      rarefy_q: 0.0
+      transform: "clr"
+      pseudocount: 1
+      description: "For Heatmap, Correlation analysis"
+
+    # PICRUSt: Raw count (no normalization)
+    - id: "04_PICRUSt_Raw"
+      scale: "none"
+      rarefy_depth: 0
+      rarefy_q: 0.0
+      transform: "none"
+      pseudocount: 1
+      description: "For PICRUSt2 (raw count)"
+
+# LEfSe settings
+# - enabled: run LEfSe stage
+# - method: python (recommended) | none
+# - legacy_maR: run MicrobiomeAnalystR-based LEfSe (not recommended; kept for compatibility)
+lefse:
+  enabled: false
+  method: "python"
+  legacy_maR: false
+  p_cut: 0.1
+  lda_cut: 2.0
+
 lefse_outdir: "GutBiomeTech/MicrobiomeAnalyst/results_R_test_MA2/04_LEfse"
 
 picrust_dir: "GutBiomeTech/vsearch_results/picrust2"
@@ -38,3 +95,7 @@ script_build_report: "scripts/build_html_report.py"
 qiime2_env_yaml: "envs/qiime2-amplicon-ubuntu-latest-conda.yml"
 picrust2_env_yaml: "envs/picrust2.yml"
 
+
+# Sample grouping
+# group_chars: Number of characters from sample ID to use for grouping (e.g., 1 = C01 -> C)
+group_chars: 1

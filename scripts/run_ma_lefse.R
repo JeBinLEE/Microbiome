@@ -1,4 +1,6 @@
 #!/usr/bin/env Rscript
+.libPaths("/home/ljb/R/x86_64-pc-linux-gnu-library/4.4")
+
 suppressPackageStartupMessages({
   library(optparse)
   library(MicrobiomeAnalystR)
@@ -46,6 +48,64 @@ message("== MicrobiomeAnalystR end-to-end + pairwise LEfSe (Genus) ==")
 message("Output dir: ", outdir)
 message("Group column: ", group_col, " | rarefy_q: ", rarefy_q)
 
+
+# -------------------------------
+# utils: never fail the pipeline
+# -------------------------------
+make_placeholder <- function(outdir, msg) {
+  dir.create(outdir, showWarnings = FALSE, recursive = TRUE)
+  # human-readable reason
+  writeLines(as.character(msg), file.path(outdir, "LEFSE_SKIPPED.txt"))
+  # also create an empty CSV so downstream tooling won't crash
+  csv_fp <- file.path(outdir, "lefse_de_output.csv")
+  if (!file.exists(csv_fp)) {
+    writeLines("feature,lda,p_value,p_adjust,group", csv_fp)
+  }
+}
+
+safe_quit_ok <- function(outdir, msg) {
+  message(msg)
+  try(make_placeholder(outdir, msg), silent = TRUE)
+  quit(save = "no", status = 0)
+}
+
+
+
+# -------------------------------
+# 0) Quick metadata sanity check (LEfSe needs >=2 groups and >=3 replicates per group)
+# -------------------------------
+meta_chk <- tryCatch(readr::read_tsv(meta_fp, show_col_types = FALSE), error=function(e) NULL)
+if (is.null(meta_chk)) {
+  msg <- paste0('Skipping LEfSe: failed to read metadata: ', meta_fp)
+  message(msg)
+  make_placeholder(outdir, msg)
+  quit(save='no', status=0)
+}
+if (!(group_col %in% names(meta_chk))) {
+  msg <- paste0('Skipping LEfSe: group column not found in metadata: ', group_col)
+  message(msg)
+  make_placeholder(outdir, msg)
+  quit(save='no', status=0)
+}
+# Some MA metadata use first column as Sample ID
+if (!("Sample" %in% names(meta_chk))) {
+  names(meta_chk)[1] <- "Sample"
+}
+meta_chk[[group_col]] <- as.character(meta_chk[[group_col]])
+meta_chk <- meta_chk[!is.na(meta_chk[[group_col]]) & meta_chk[[group_col]] != "", , drop=FALSE]
+ct <- table(meta_chk[[group_col]])
+if (length(ct) < 2) {
+  msg <- paste0('Skipping LEfSe: need >=2 groups. Found: ', paste(names(ct), collapse=','))
+  message(msg)
+  make_placeholder(outdir, msg)
+  quit(save='no', status=0)
+}
+if (any(ct < 3)) {
+  msg <- paste0('Skipping LEfSe: each group needs >=3 replicates. Counts: ', paste(names(ct), ct, sep='=', collapse=', '))
+  message(msg)
+  make_placeholder(outdir, msg)
+  quit(save='no', status=0)
+}
 ## 유틸: 파일명 안전 토큰
 safe_token <- function(x) gsub("[^A-Za-z0-9]+","_", x)
 
@@ -102,39 +162,66 @@ stopifnot(exists("condenseOTUs", mode = "function"))
 mbSet <- Init.mbSetObj()
 mbSet <- SetModuleType(mbSet, "mdp")
 
-mbSet <- ReadSampleTable(mbSet, meta_fp)         # Group1 필수
-mbSet <- Read16STaxaTable(mbSet, tax_fp)         # Kingdom~Species
-mbSet <- Read16SAbundData(mbSet, feat_fp, "text", "QIIME", "T", "false")
+mbSet <- tryCatch(ReadSampleTable(mbSet, meta_fp), error=function(e){ msg<-paste0('LEfSe: ReadSampleTable failed: ', conditionMessage(e)); message(msg); make_placeholder(outdir,msg); quit(save='no',status=0) })
+mbSet <- tryCatch(Read16STaxaTable(mbSet, tax_fp), error=function(e){ msg<-paste0('LEfSe: Read16STaxaTable failed: ', conditionMessage(e)); message(msg); make_placeholder(outdir,msg); quit(save='no',status=0) })
+mbSet <- tryCatch(Read16SAbundData(mbSet, feat_fp, "text", "QIIME", "T", "false"), error=function(e){ msg<-paste0('LEfSe: Read16SAbundData failed: ', conditionMessage(e)); message(msg); make_placeholder(outdir,msg); quit(save='no',status=0) })
 
-mbSet <- SanityCheckData(mbSet, "text", "sample", "true")
-mbSet <- SanityCheckSampleData(mbSet)
+# Some MA builds return a broken object (atomic vector) without throwing.
+if (!is.list(mbSet) || is.null(mbSet$dataSet)) {
+  safe_quit_ok(outdir, "Skipping LEfSe: MicrobiomeAnalystR returned an invalid mbSet object after reading inputs")
+}
 
-mbSet <- SetMetaAttributes(mbSet, "1")           # 첫 factor = Group1
+mbSet <- tryCatch(SanityCheckData(mbSet, "text", "sample", "true"),
+                  error=function(e) { safe_quit_ok(outdir, paste0('Skipping LEfSe: SanityCheckData failed: ', conditionMessage(e))) })
+mbSet <- tryCatch(SanityCheckSampleData(mbSet),
+                  error=function(e) { safe_quit_ok(outdir, paste0('Skipping LEfSe: SanityCheckSampleData failed: ', conditionMessage(e))) })
 
-mbSet <- PlotLibSizeView(mbSet, "norm_libsizes_0", "png")
-mbSet <- CreatePhyloseqObj(mbSet, "text", "QIIME", "F", "false")
+# Set group column as the primary metadata.
+mbSet <- tryCatch(SetMetaAttributes(mbSet, "1"),
+                  error=function(e) { safe_quit_ok(outdir, paste0('Skipping LEfSe: SetMetaAttributes failed: ', conditionMessage(e))) })
+
+mbSet <- tryCatch(PlotLibSizeView(mbSet, "norm_libsizes_0", "png"),
+                  error=function(e) { message('[warn] PlotLibSizeView failed: ', conditionMessage(e)); mbSet })
+mbSet <- tryCatch(CreatePhyloseqObj(mbSet, "text", "QIIME", "F", "false"),
+                  error=function(e) { safe_quit_ok(outdir, paste0('Skipping LEfSe: CreatePhyloseqObj failed: ', conditionMessage(e))) })
 
 # -------------------------------
 # 2) 전체 필터 → 정규화
 # -------------------------------
-mbSet <- ApplyAbundanceFilter(mbSet, "prevalence", 4, 0.10)
-mbSet <- ApplyVarianceFilter(mbSet, "iqr", 0.10)
+mbSet <- tryCatch(ApplyAbundanceFilter(mbSet, "prevalence", count_cut, 0.10),
+                  error=function(e) { message('[warn] ApplyAbundanceFilter failed: ', conditionMessage(e)); mbSet })
+mbSet <- tryCatch(ApplyVarianceFilter(mbSet, "iqr", 0.10),
+                  error=function(e) { message('[warn] ApplyVarianceFilter failed: ', conditionMessage(e)); mbSet })
 
-libsizes  <- phyloseq::sample_sums(mbSet$dataSet$proc.phyobj)
-min_depth <- min(libsizes)
-mbSet <- PerformNormalization(
-  mbSet,
-  "none",                  # norm.method
-  "colsum",                # scale.method
-  "none",                  # trans.method
-  "true",                  # rarefy
-  30000                    # rarefy.depth (고정값)
+libsizes <- tryCatch(phyloseq::sample_sums(mbSet$dataSet$proc.phyobj), error=function(e) numeric(0))
+if (!length(libsizes)) safe_quit_ok(outdir, "Skipping LEfSe: cannot compute library sizes")
+
+depth <- if (rarefy_q > 0 && rarefy_q <= 1) {
+  as.integer(stats::quantile(libsizes, probs = rarefy_q, na.rm = TRUE))
+} else {
+  min(libsizes)
+}
+depth <- max(1L, min(depth, min(libsizes)))
+
+mbSet <- tryCatch(
+  PerformNormalization(
+    mbSet,
+    "none",     # norm.method
+    "colsum",   # scale.method
+    "none",     # trans.method
+    "true",     # rarefy
+    depth
+  ),
+  error=function(e) { safe_quit_ok(outdir, paste0('Skipping LEfSe: PerformNormalization failed: ', conditionMessage(e))) }
 )
 
 # -------------------------------
 # 3) LEfSe (전체 그룹) - Genus
 # -------------------------------
-mbSet <- PerformLefseAnal(mbSet, 0.10, "fdr", 2.0, "Group1", "F", "NA", "Genus")
+mbSet <- tryCatch(
+  PerformLefseAnal(mbSet, p_cut, "fdr", 2.0, group_col, "F", "NA", "Genus"),
+  error=function(e) { safe_quit_ok(outdir, paste0('Skipping LEfSe: PerformLefseAnal failed: ', conditionMessage(e))) }
+)
 
 ## ✅ 전체 결과 CSV 저장
 rt_all <- mbSet$analSet$lefse$resTable
@@ -147,21 +234,29 @@ if (!is.null(rt_all) && NROW(rt_all) > 0) {
   readr::write_csv(rt_all, "lefse_de_output.csv")
 } else {
   # 결과가 없으면 빈 CSV라도 생성(파이프라인 호환성용)
-  readr::write_csv(tibble::tibble(), "lefse_de_output.csv")
+  writeLines("feature,lda,p_value,p_adjust,group", "lefse_de_output.csv")
 }
 
 ## 그림 저장
-mbSet <- PlotLEfSeSummary(mbSet, 30, "dot", "lefse_dot_genus", "png")
-mbSet <- PlotLEfSeSummary(mbSet, 30, "bar", "lefse_bar_genus", "png")
+mbSet <- tryCatch(PlotLEfSeSummary(mbSet, 30, "dot", "lefse_dot_genus", "png"),
+                  error=function(e) { message('[warn] PlotLEfSeSummary(dot) failed: ', conditionMessage(e)); mbSet })
+mbSet <- tryCatch(PlotLEfSeSummary(mbSet, 30, "bar", "lefse_bar_genus", "png"),
+                  error=function(e) { message('[warn] PlotLEfSeSummary(bar) failed: ', conditionMessage(e)); mbSet })
 
 # -------------------------------
 # 4) 그룹 페어별 — 없으면 pass
 # -------------------------------
-meta <- readr::read_table(meta_fp, show_col_types = FALSE)
-if (!("Group1" %in% names(meta))) stop("metadata에 Group1 열이 없습니다.")
-if (!("Sample" %in% names(meta))) stop("metadata에 Sample 열이 없습니다.")
+meta <- tryCatch(readr::read_table(meta_fp, show_col_types = FALSE), error=function(e) NULL)
+if (is.null(meta)) {
+  safe_quit_ok(outdir, paste0('Skipping pairwise LEfSe: failed to read metadata: ', meta_fp))
+}
+# In MA metadata, the first column is usually the sample id (#NAME).
+if (!("Sample" %in% names(meta))) names(meta)[1] <- "Sample"
+if (!(group_col %in% names(meta))) {
+  safe_quit_ok(outdir, paste0('Skipping pairwise LEfSe: group column not found: ', group_col))
+}
 
-pairs <- combn(unique(meta$Group1), 2, simplify = FALSE)
+pairs <- combn(unique(as.character(meta[[group_col]])), 2, simplify = FALSE)
 
 for (pp in pairs) {
   mbSet_filter <- mbSet
@@ -171,7 +266,7 @@ for (pp in pairs) {
   message("== Pairwise: ", g1, " vs ", g2, " ==")
   
   # smpl.nm.vec 전역 주입 (UpdateSampleItems가 전역을 읽음)
-  smpl.nm.vec <- meta %>% dplyr::filter(Group1 %in% c(g1,g2)) %>% dplyr::pull(Sample)
+  smpl.nm.vec <- meta %>% dplyr::filter(.data[[group_col]] %in% c(g1, g2)) %>% dplyr::pull(Sample)
   assign("smpl.nm.vec", smpl.nm.vec, envir = .GlobalEnv)
   
   # 샘플 반영; 실패하면 패스
@@ -185,7 +280,7 @@ for (pp in pairs) {
   }
   
   # 필터; 실패해도 계속 진행
-  mbSet_filter <- tryCatch(ApplyAbundanceFilter(mbSet_filter, "prevalence", 4, 0.10),
+  mbSet_filter <- tryCatch(ApplyAbundanceFilter(mbSet_filter, "prevalence", count_cut, 0.10),
                            error = function(e) { message("[warn] ApplyAbundanceFilter: ", e$message); return(mbSet_filter) })
   mbSet_filter <- tryCatch(ApplyVarianceFilter(mbSet_filter, "iqr", 0.10),
                            error = function(e) { message("[warn] ApplyVarianceFilter: ", e$message); return(mbSet_filter) })
@@ -196,11 +291,18 @@ for (pp in pairs) {
   if (!length(libsizes)) { message("[skip] no libsizes: ", g1, "vs", g2); next }
   min_depth <- min(libsizes)
   
+  depth2 <- if (rarefy_q > 0 && rarefy_q <= 1) {
+    as.integer(stats::quantile(libsizes, probs = rarefy_q, na.rm = TRUE))
+  } else {
+    min(libsizes)
+  }
+  depth2 <- max(1L, min(depth2, min(libsizes)))
+
   mbSet_filter <- tryCatch(
     PerformNormalization(
       mbSet_filter,
       "none", "colsum", "none",
-      "true", 30000
+      "true", depth2
     ),
     error = function(e) { message("[skip] PerformNormalization: ", e$message); return(NULL) }
   )
@@ -208,7 +310,7 @@ for (pp in pairs) {
   
   # LEfSe; 실패하면 패스
   mbSet_filter <- tryCatch(
-    PerformLefseAnal(mbSet_filter, 0.10, "fdr", 2.0, "Group1", "F", "NA", "Genus"),
+    PerformLefseAnal(mbSet_filter, p_cut, "fdr", 2.0, group_col, "F", "NA", "Genus"),
     error = function(e) { message("[skip] PerformLefseAnal: ", e$message); return(NULL) }
   )
   if (is.null(mbSet_filter)) next

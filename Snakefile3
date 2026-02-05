@@ -1,0 +1,628 @@
+###############################################
+# Snakefile (config-driven, end-to-end report)
+###############################################
+
+# snakemake -j 40 --snakefile Snakefile2 --configfile config.yaml
+configfile: "config.yaml"
+
+# -----------------------------
+# 0) Config with safe defaults
+# -----------------------------
+REF_DIR          = config.get("ref_dir", "NCBI-RefSeq-16s-202505")
+
+ANALYSIS         = config.get("analysis_dir", "GutBiomeTech/vsearch_results")
+
+FASTQ_DIR        = config.get("fastq_dir", "/home/ljb/qiime2_analysis/GutBiomeTech/M17_fastq")
+SUFFIX_R1        = config.get("suffix_r1", "_L001_R1_001.fastq.gz")
+SUFFIX_R2        = config.get("suffix_r2", "_L001_R2_001.fastq.gz")
+
+THREADS_CUTADAPT = str(config.get("threads_cutadapt", 24))
+THREADS_BLAST    = str(config.get("threads_blast", 48))
+
+MA_DIR        = config.get("ma_dir", "GutBiomeTech/MicrobiomeAnalyst")
+MA_UPLOAD_DIR = f"{MA_DIR}/upload"
+MA_OUTDIR     = config.get("ma_outdir", f"{MA_DIR}/results_R_test_MA2")
+MA_GROUP      = config.get("ma_group", "Group1")
+GROUP_CHARS   = str(config.get("group_chars", 1))
+RAREFY_Q      = str(config.get("rarefy_q", 0.00))
+
+LEFSE_OUTDIR  = config.get("lefse_outdir", f"{MA_OUTDIR}/04_LEfse")
+
+PICRU         = config.get("picrust_dir", f"{ANALYSIS}/picrust2")
+TGT           = config.get("picrust_export_dir", f"{PICRU}/picrust2_data")
+
+RS_BIN        = config.get("rscript_bin", "/usr/bin/Rscript")
+
+REPORT_DIR    = config.get("report_dir", "report")
+
+JUNK_DIR = "_intermediate"
+# 내부 센티널
+MANIFEST      = f"{ANALYSIS}/sample_manifest.txt"
+ANALYZE_DONE  = ".done/_3_analyze_sh.done"
+
+# 스크립트 / 환경
+SCRIPT_BUILD_DB             = config.get("script_build_db", "rules/2_NCBI_build_db.sh")
+SCRIPT_MAKE_MANIFEST        = config.get("script_make_manifest", "rules/make_manifest.sh")
+SCRIPT_QIIME2_ANALYZE       = config.get("script_qiime2_analyze", "rules/3_analyze.sh")
+SCRIPT_MA_INPUT             = config.get("script_make_ma_input", "rules/make_MicroAnalysis_input.sh")
+SCRIPT_MA_PIPELINE_R        = config.get("script_ma_pipeline_r", "scripts/microbiomeanalyst_pipeline.R")
+SCRIPT_LEFSE_R              = config.get("script_lefse_r", "scripts/run_ma_lefse.R")
+SCRIPT_PICRUST_QC_EXPORT    = config.get("script_picrust_qc_export", "scripts/picrust2_qc_and_export.sh")
+SCRIPT_PICRUST_PLOT_R       = config.get("script_picrust_plot_r", "scripts/plot_kegg_by_class.R")
+SCRIPT_BUILD_REPORT         = config.get("script_build_report", "scripts/build_html_report.py")
+
+QIIME2_ENV_YAML             = config.get("qiime2_env_yaml", "envs/qiime2-amplicon-ubuntu-latest-conda.yml")
+PICRUST2_ENV_YAML           = config.get("picrust2_env_yaml", "envs/picrust2.yml")
+
+
+# -----------------------------
+# 0.5) Analysis sweeps (normalization + alpha/beta + optional LEfSe)
+# -----------------------------
+# sweeps.normalizations: [{id, scale, rarefy_depth, rarefy_q, transform, pseudocount}, ...]
+SWEEPS = config.get("sweeps", {})
+NORM_SWEEPS = SWEEPS.get("normalizations", [])
+if not NORM_SWEEPS:
+    # Backward-compatible fallback (uses existing keys)
+    default_depth = int(config.get("rarefy_depth", 50000))
+    default_q     = float(config.get("rarefy_q", 0.00))
+    default_tr    = str(config.get("transform", "clr"))
+    NORM_SWEEPS = [{
+        "id": "primary",
+        "scale": "rarefy",
+        "rarefy_depth": default_depth,
+        "rarefy_q": default_q,
+        "transform": default_tr,
+        "pseudocount": 1
+    }]
+
+NORM_IDS   = [d.get("id") for d in NORM_SWEEPS]
+NORM_BY_ID = {d.get("id"): d for d in NORM_SWEEPS}
+PRIMARY_NORM = SWEEPS.get("primary_norm", NORM_IDS[0])
+
+FILTER = config.get("filter", {})
+FILTER_ENABLED  = bool(FILTER.get("enabled", True))
+MIN_TOTAL_COUNT = float(FILTER.get("min_total_count", config.get("count_cut", 4)))
+PREVALENCE      = float(FILTER.get("prevalence", 0.10))
+IQR_REMOVE      = float(FILTER.get("iqr_remove", config.get("iqr_remove", 0.10)))
+
+ALPHA = config.get("alpha", {})
+ALPHA_RANKS = ALPHA.get("ranks", ["ASV","Genus","Family","Species"])
+ALPHA_MEAS  = ALPHA.get("measures", ["Observed","Chao1","Shannon","Simpson"])
+ALPHA_STATS = ALPHA.get("stats", ["kruskal","anova","wilcoxon"])
+
+BETA = config.get("beta", {})
+BETA_RANKS = BETA.get("ranks", ["Genus","Family"])
+BETA_DIST  = BETA.get("distances", ["bray","jaccard","euclidean"])
+BETA_ORD   = BETA.get("ordinations", ["PCoA","NMDS"])
+BETA_STATS = BETA.get("stats", ["permanova","anosim"])
+BETA_PERMS = int(BETA.get("permutations", 999))
+
+LEFSE = config.get("lefse", {})
+LEFSE_ENABLED = bool(LEFSE.get("enabled", False))
+LEFSE_RANK    = str(LEFSE.get("rank", "Genus"))
+LEFSE_REL     = bool(LEFSE.get("relative", True))
+LEFSE_MIN_PER_GROUP = int(LEFSE.get("min_per_group", 3))
+LEFSE_SWEEPS  = LEFSE.get("sweeps", [{"id":"p0.10_lda2.0","p_cut":0.10,"lda_cut":2.0}])
+LEFSE_IDS     = [d.get("id") for d in LEFSE_SWEEPS]
+LEFSE_BY_ID   = {d.get("id"): d for d in LEFSE_SWEEPS}
+LEFSE_LEGACY_MAR = bool(LEFSE.get("legacy_maR", False))
+
+SCRIPT_LEFSE_PY = config.get("script_lefse_py", "scripts/run_lefse.py")
+
+# derived common paths
+FEATURE_TABLE  = f"{MA_UPLOAD_DIR}/feature_table_for_MA.txt"
+TAXONOMY_TABLE = f"{MA_UPLOAD_DIR}/taxonomy_for_MA.txt"
+METADATA_TABLE = f"{MA_UPLOAD_DIR}/metadata_for_MA.txt"
+
+MA_GROUP_COL = MA_GROUP  # group column name in metadata
+LOG_DIR = config.get("log_dir", "logs")
+
+# alias for consistency
+SCRIPT_MA_PIPELINE = SCRIPT_MA_PIPELINE_R
+
+# -----------------------------
+# 1) Final target
+# -----------------------------
+rule all:
+    input:
+        # 분석 완료 플래그
+        ANALYZE_DONE,
+
+        # MA 업로드 3종
+        FEATURE_TABLE,
+        METADATA_TABLE,
+        TAXONOMY_TABLE,
+
+        # MA pipeline sweeps (per normalization)
+        expand(f"{MA_OUTDIR}/sweeps/{{norm}}/.done_pipeline", norm=NORM_IDS),
+
+        # MA 파이프라인 (primary published to MA_OUTDIR root)
+        f"{MA_OUTDIR}/.done_pipeline",
+
+        # Optional LEfSe sweeps (python runner)
+        (expand(f"{MA_OUTDIR}/sweeps/{{norm}}/04_LEfse_py/{{lefse}}/.done", norm=NORM_IDS, lefse=LEFSE_IDS) if LEFSE_ENABLED else []),
+
+        # (legacy) pairwise LEfSe (MicrobiomeAnalystR) — optional
+        ([f"{LEFSE_OUTDIR}/.done_pairwise"] if LEFSE_LEGACY_MAR else []),
+
+        # 그림 수집 완료
+        f"{MA_OUTDIR}/.done_figures",
+
+        # PICRUSt2 + export + plot
+        ".done/_picrust2.done",
+        f"{TGT}/KO_unstrat.tsv",
+        f"{TGT}/pathway_unstrat.tsv",
+        f"{PICRU}/plots_by_class/errorbar_by_class.pdf",
+
+        # 최종 리포트
+        f"{REPORT_DIR}/index.html",
+
+        # junk sweep
+        f"{JUNK_DIR}/.done_sweep"
+
+
+# =========================================================
+# 2) RefSeq 16S DB 구축 (존재 시 스킵)
+# =========================================================
+rule build_db:
+    output:
+        db  = f"{REF_DIR}/ncbi-refseqs-blastdb.qza",
+        tax = f"{REF_DIR}/ncbi-refseqs-taxonomy-derep.qza"
+    params:
+        script  = SCRIPT_BUILD_DB,
+        ref_dir = REF_DIR
+    shell:
+        r"""
+        set -euo pipefail
+        REF_DIR="{params.ref_dir}" bash "{params.script}"
+        """
+
+# =========================================================
+# 3) FASTQ → sample_manifest.txt
+# =========================================================
+rule make_manifest:
+    input:
+        db  = rules.build_db.output.db,
+        tax = rules.build_db.output.tax
+    output:
+        MANIFEST
+    params:
+        script    = SCRIPT_MAKE_MANIFEST,
+        analysis  = ANALYSIS,
+        fastq_dir = FASTQ_DIR,
+        r1        = SUFFIX_R1,
+        r2        = SUFFIX_R2
+    shell:
+        r"""
+        set -euo pipefail
+        ANALYSIS="{params.analysis}" FASTQ_DIR="{params.fastq_dir}" \
+        SUFFIX_R1="{params.r1}" SUFFIX_R2="{params.r2}" \
+        MANIFEST="{output}" bash "{params.script}"
+        """
+
+# =========================================================
+# 4) QIIME2 분석 (cutadapt/BLAST 등)
+# =========================================================
+rule run_qiime2:
+    input:
+        manifest = MANIFEST,
+        db       = rules.build_db.output.db,
+        tax      = rules.build_db.output.tax
+    output:
+        done_file = ANALYZE_DONE,
+        ft        = f"{ANALYSIS}/ASV_quantified/feature-table.txt",
+        rep_qza   = f"{ANALYSIS}/rep-seqs-dada2-2.qza",
+        tab_qza   = f"{ANALYSIS}/table-dada2-2.qza"
+    params:
+        script        = SCRIPT_QIIME2_ANALYZE,
+        analysis      = ANALYSIS,
+        threads_cut   = THREADS_CUTADAPT,
+        threads_blast = THREADS_BLAST,
+        ref_dir       = REF_DIR,
+        manifest      = MANIFEST
+    conda:
+        QIIME2_ENV_YAML
+    shell:
+        r"""
+        set -euo pipefail
+        mkdir -p .done
+        ANALYSIS="{params.analysis}" \
+        THREADS_CUTADAPT="{params.threads_cut}" THREADS_BLAST="{params.threads_blast}" \
+        REF_DIR="{params.ref_dir}" MANIFEST="{params.manifest}" \
+        bash "{params.script}"
+
+        test -s "{output.ft}"
+        test -s "{output.rep_qza}"
+        test -s "{output.tab_qza}"
+        date > "{output.done_file}"
+        """
+
+# =========================================================
+# 5) MicrobiomeAnalyst 업로드 파일 생성(feature/tax/meta)
+# =========================================================
+rule make_MicrobiomeAnalystR_input:
+    input:
+        ANALYZE_DONE,
+        f"{ANALYSIS}/ASV_quantified/feature-table.txt",
+        f"{ANALYSIS}/sample_manifest.txt",
+        script = SCRIPT_MA_INPUT
+    output:
+        ft   = f"{MA_UPLOAD_DIR}/feature_table_for_MA.txt",
+        meta = f"{MA_UPLOAD_DIR}/metadata_for_MA.txt",
+        tax  = f"{MA_UPLOAD_DIR}/taxonomy_for_MA.txt"
+    params:
+        analysis = ANALYSIS,
+        ma_dir   = MA_DIR,
+        group_chars = GROUP_CHARS
+    shell:
+        r"""
+        set -euo pipefail
+        chmod +x "{input.script}"
+        ANALYSIS="{params.analysis}" MA_DIR="{params.ma_dir}" GROUP_CHARS="{params.group_chars}" \
+        bash "{input.script}"
+        test -s "{output.ft}"
+        test -s "{output.meta}"
+        test -s "{output.tax}"
+        """
+
+# =========================================================
+# 6) MicrobiomeAnalystR 전체 파이프라인 (alpha/beta/LEfSe 전 처리)
+# =========================================================
+
+# =========================================================
+# 6) MicrobiomeAnalystR 전체 파이프라인 (sweep by normalization)
+# =========================================================
+rule run_MicrobiomeAnalyst_pipeline_one:
+    input:
+        feat = FEATURE_TABLE,
+        tax  = TAXONOMY_TABLE,
+        meta = METADATA_TABLE
+    output:
+        done = touch(f"{MA_OUTDIR}/sweeps/{{norm}}/.done_pipeline"),
+        feat = f"{MA_OUTDIR}/sweeps/{{norm}}/00_QC_Normalization/feature_table_filtered.tsv",
+        tax  = f"{MA_OUTDIR}/sweeps/{{norm}}/00_QC_Normalization/taxonomy_filtered.tsv",
+        meta = f"{MA_OUTDIR}/sweeps/{{norm}}/00_QC_Normalization/metadata_filtered.tsv",
+    params:
+        outdir = lambda wc: f"{MA_OUTDIR}/sweeps/{wc.norm}",
+        group = MA_GROUP_COL,
+
+        # filtering
+        filter_enabled = lambda wc: "true" if bool(NORM_BY_ID[wc.norm].get("filter_enabled", FILTER_ENABLED)) else "false",
+        min_total_count = lambda wc: float(NORM_BY_ID[wc.norm].get("min_total_count", MIN_TOTAL_COUNT)),
+        prevalence = lambda wc: float(NORM_BY_ID[wc.norm].get("prevalence", PREVALENCE)),
+        iqr_remove = lambda wc: float(NORM_BY_ID[wc.norm].get("iqr_remove", IQR_REMOVE)),
+
+        # normalization
+        scale = lambda wc: str(NORM_BY_ID[wc.norm].get("scale","rarefy")),
+        rarefy_depth = lambda wc: int(NORM_BY_ID[wc.norm].get("rarefy_depth", 0) or 0),
+        rarefy_q = lambda wc: float(NORM_BY_ID[wc.norm].get("rarefy_q", 0.00) or 0.00),
+        transform = lambda wc: str(NORM_BY_ID[wc.norm].get("transform","none")),
+        pseudocount = lambda wc: float(NORM_BY_ID[wc.norm].get("pseudocount", 1) or 1),
+
+        seed = 22,
+
+        # alpha/beta selections
+        alpha_ranks = ",".join(ALPHA_RANKS),
+        alpha_measures = ",".join(ALPHA_MEAS),
+        alpha_stats = ",".join(ALPHA_STATS),
+        beta_ranks = ",".join(BETA_RANKS),
+        beta_distances = ",".join(BETA_DIST),
+        beta_ordinations = ",".join(BETA_ORD),
+        beta_stats = ",".join(BETA_STATS),
+        permutations = BETA_PERMS,
+
+        script = SCRIPT_MA_PIPELINE,
+        logs = lambda wc: f"{MA_OUTDIR}/sweeps/{wc.norm}/logs"
+    log:
+        f"{LOG_DIR}/MicrobiomeAnalyst_pipeline/{{norm}}.log"
+    shell:
+        r"""
+        set -euo pipefail
+        mkdir -p "{params.logs}"
+        mkdir -p "$(dirname "{log}")"
+
+        "{RS_BIN}" "{params.script}"           --feat_fp "{input.feat}"           --tax_fp  "{input.tax}"           --meta_fp "{input.meta}"           --outdir  "{params.outdir}"           --group   "{params.group}"           --filter_enabled "{params.filter_enabled}"           --min_total_count "{params.min_total_count}"           --prevalence "{params.prevalence}"           --iqr_remove "{params.iqr_remove}"           --scale "{params.scale}"           --rarefy_depth "{params.rarefy_depth}"           --rarefy_q "{params.rarefy_q}"           --transform "{params.transform}"           --pseudocount "{params.pseudocount}"           --seed "{params.seed}"           --alpha_ranks "{params.alpha_ranks}"           --alpha_measures "{params.alpha_measures}"           --alpha_stats "{params.alpha_stats}"           --beta_ranks "{params.beta_ranks}"           --beta_distances "{params.beta_distances}"           --beta_ordinations "{params.beta_ordinations}"           --beta_stats "{params.beta_stats}"           --permutations "{params.permutations}"           > "{log}" 2>&1
+        """
+
+# Publish the primary normalization results to MA_OUTDIR root (keeps existing report/figure collection unchanged)
+rule publish_primary_MA:
+    input:
+        f"{MA_OUTDIR}/sweeps/{PRIMARY_NORM}/.done_pipeline"
+    output:
+        touch(f"{MA_OUTDIR}/.done_pipeline")
+    params:
+        src = f"{MA_OUTDIR}/sweeps/{PRIMARY_NORM}",
+        dst = MA_OUTDIR
+    shell:
+        r"""
+        set -euo pipefail
+        mkdir -p "{params.dst}"
+        # copy only analysis folders to root (avoid overwriting sweeps/)
+        for d in 00_QC_Normalization 01_Alpha 02_Beta 03_Composition; do
+          if [ -d "{params.src}/$d" ]; then
+            rm -rf "{params.dst}/$d"
+            cp -a "{params.src}/$d" "{params.dst}/"
+          fi
+        done
+        """
+
+# =========================================================
+# 6.5) LEfSe sweeps (python runner; uses filtered tables from each norm run)
+# =========================================================
+rule run_LEfSe_py_sweep:
+    input:
+        done = f"{MA_OUTDIR}/sweeps/{{norm}}/.done_pipeline",
+        feat = f"{MA_OUTDIR}/sweeps/{{norm}}/00_QC_Normalization/feature_table_filtered.tsv",
+        tax  = f"{MA_OUTDIR}/sweeps/{{norm}}/00_QC_Normalization/taxonomy_filtered.tsv",
+        meta = f"{MA_OUTDIR}/sweeps/{{norm}}/00_QC_Normalization/metadata_filtered.tsv",
+    output:
+        touch(f"{MA_OUTDIR}/sweeps/{{norm}}/04_LEfse_py/{{lefse}}/.done")
+    params:
+        outdir = lambda wc: f"{MA_OUTDIR}/sweeps/{wc.norm}/04_LEfse_py/{wc.lefse}",
+        group = MA_GROUP_COL,
+        rank = lambda wc: LEFSE_RANK,
+        relative_flag = lambda wc: ("--relative" if LEFSE_REL else ""),
+        min_per_group = lambda wc: LEFSE_MIN_PER_GROUP,
+        p_cut = lambda wc: float(LEFSE_BY_ID[wc.lefse].get("p_cut", 0.10)),
+        lda_cut = lambda wc: float(LEFSE_BY_ID[wc.lefse].get("lda_cut", 2.0)),
+        script = SCRIPT_LEFSE_PY
+    log:
+        f"{LOG_DIR}/LEfSe_py/{{norm}}_{{lefse}}.log"
+    shell:
+        r"""
+        set -euo pipefail
+        mkdir -p "{params.outdir}"
+        mkdir -p "$(dirname "{log}")"
+
+        python "{params.script}"           --feature_table "{input.feat}"           --taxonomy "{input.tax}"           --metadata "{input.meta}"           --class_col "{params.group}"           --rank "{params.rank}"           {params.relative_flag}           --min_per_group "{params.min_per_group}"           --p_cut "{params.p_cut}"           --lda_cut "{params.lda_cut}"           --outdir "{params.outdir}"           > "{log}" 2>&1
+        """
+
+# =========================================================
+# 7) pairwise LEfSe (ALL + 그룹쌍)
+# =========================================================
+rule run_MicrobiomeAnalyst_LefSe:
+    input:
+        ft     = f"{MA_UPLOAD_DIR}/feature_table_for_MA.txt",
+        meta   = f"{MA_UPLOAD_DIR}/metadata_for_MA.txt",
+        tax    = f"{MA_UPLOAD_DIR}/taxonomy_for_MA.txt",
+        script = SCRIPT_LEFSE_R
+    output:
+        touch(f"{LEFSE_OUTDIR}/.done_pairwise")
+    params:
+        outdir = LEFSE_OUTDIR,
+        group  = MA_GROUP,
+        rq     = RAREFY_Q,
+        pcut   = str(config.get("lefse_p_cut", 0.1)),
+        count_cut = str(config.get("lefse_count_cut", 4)),
+        rs_bin = RS_BIN
+    shell:
+        r"""
+        set -euo pipefail
+        mkdir -p "{params.outdir}"
+        "{params.rs_bin}" "{input.script}" \
+          --feat_fp "$(realpath "{input.ft}")" \
+          --tax_fp  "$(realpath "{input.tax}")" \
+          --meta_fp "$(realpath "{input.meta}")" \
+          --outdir  "$(realpath -m "{params.outdir}")" \
+          --group   "{params.group}" \
+          --p_cut   "{params.pcut}" \
+          --count_cut "{params.count_cut}" \
+          --rarefy_q {params.rq}
+        date > "{output}"
+        """
+
+# =========================================================
+# 8) 그림 수집 (평탄화)
+# =========================================================
+rule collect_ma_figures:
+    input:
+        f"{MA_OUTDIR}/.done_pipeline"
+    output:
+        touch(f"{MA_OUTDIR}/.done_figures")
+    params:
+        outdir = MA_OUTDIR,
+        dest   = f"{MA_OUTDIR}/99_Figures"
+    shell:
+        r"""
+        set -euo pipefail
+        OUT="{params.outdir}"
+        DEST="{params.dest}"
+        mkdir -p "$DEST"
+
+        find "$OUT" -type f \( -iname '*.png' -o -iname '*.pdf' -o -iname '*.svg' -o -iname '*.jpg' -o -iname '*.jpeg' \) ! -path "$DEST/*" -print0 \
+          | while IFS= read -r -d '' f; do
+                rel="${{f#"$OUT/"}}"
+                safe="${{rel//\//__}}"
+                cp -f "$f" "$DEST/$safe"
+            done
+
+        printf "collected\toriginal_path\n" > "$DEST/_index.tsv"
+        find "$DEST" -type f \( -iname '*.png' -o -iname '*.pdf' -o -iname '*.svg' -o -iname '*.jpg' -o -iname '*.jpeg' \) -printf "%f\t$OUT/99_Figures/%f\n" >> "$DEST/_index.tsv"
+
+        date > "{output}"
+        """
+
+# =========================================================
+# 9) PICRUSt2: QIIME2 산출물 export → 실행
+# =========================================================
+rule export_repseqs_fna:
+    input:
+        rep = f"{ANALYSIS}/rep-seqs-dada2-2.qza"
+    output:
+        fna = f"{ANALYSIS}/ASV_quantified/rep_seqs.fna"
+    shell:
+        r"""
+        set -euo pipefail
+        tmpdir="$(mktemp -d)"
+        qiime tools export --input-path "{input.rep}" --output-path "$tmpdir"
+        mkdir -p "$(dirname "{output.fna}")"
+        cp "$tmpdir/dna-sequences.fasta" "{output.fna}"
+        """
+
+rule export_table_biom:
+    input:
+        tab = f"{ANALYSIS}/table-dada2-2.qza"
+    output:
+        biom = f"{ANALYSIS}/ASV_quantified/table_seqs.biom"
+    shell:
+        r"""
+        set -euo pipefail
+        tmpdir="$(mktemp -d)"
+        qiime tools export --input-path "{input.tab}" --output-path "$tmpdir"
+        mkdir -p "$(dirname "{output.biom}")"
+        cp "$tmpdir/feature-table.biom" "{output.biom}"
+        """
+
+rule run_picrust2:
+    input:
+        fna  = f"{ANALYSIS}/ASV_quantified/rep_seqs.fna",
+        biom = f"{ANALYSIS}/ASV_quantified/table_seqs.biom"
+    output:
+        done = f".done/_picrust2.done"
+    params:
+        outdir = PICRU
+    threads: int(config.get("threads_picrust2", 40))
+    conda: PICRUST2_ENV_YAML
+    shell:
+        r"""
+        set -euo pipefail
+        OUTDIR="{params.outdir}"
+        WORKDIR="$(mktemp -d)"
+        trap 'rm -rf "$WORKDIR"' EXIT
+
+        picrust2_pipeline.py \
+          -s "{input.fna}" \
+          -i "{input.biom}" \
+          -o "$WORKDIR/out" \
+          -p {threads}
+
+        rm -rf "$OUTDIR"
+        mkdir -p "$(dirname "$OUTDIR")"
+        mv "$WORKDIR/out" "$OUTDIR"
+        mkdir -p .done
+        date > "{output.done}"
+        """
+
+# Bash로 QC + export (unstrat only)
+rule qc_and_export_picrust2:
+    input:
+        flag = ".done/_picrust2.done"
+    output:
+        ko_un = f"{TGT}/KO_unstrat.tsv",
+        pw_un = f"{TGT}/pathway_unstrat.tsv",
+        nsti  = f"{TGT}/nsti_summary.txt"
+    params:
+        OUTDIR = PICRU,
+        TGT    = TGT,
+        script = SCRIPT_PICRUST_QC_EXPORT
+    shell:
+        r"""
+        set -euo pipefail
+        bash "{params.script}" "{params.OUTDIR}" "{params.TGT}"
+        """
+
+# KEGG by group (errorbar_by_class.pdf만 생성)
+rule plot_kegg_by_class:
+    input:
+        ko_un = f"{TGT}/KO_unstrat.tsv",
+        meta  = f"{MA_DIR}/upload/metadata_for_MA.txt"
+    output:
+        pdf = f"{PICRU}/plots_by_class/errorbar_by_class.pdf"
+    params:
+        out_dir = f"{PICRU}/plots_by_class",
+        group   = MA_GROUP,
+        topn    = int(config.get("picrust_topn", 5)),
+        rs_bin  = RS_BIN,
+        script  = SCRIPT_PICRUST_PLOT_R
+    shell:
+        r"""
+        set -euo pipefail
+        mkdir -p "{params.out_dir}"
+        "{params.rs_bin}" "{params.script}" \
+          "{input.ko_un}" "{input.meta}" "{params.group}" "{params.out_dir}" "{params.topn}"
+        test -s "{output.pdf}"
+        """
+
+# =========================================================
+# 10) HTML Report (계층형, assets 포함)
+# =========================================================
+#
+
+rule build_html_report:
+    input:
+        ma_done    = f"{MA_OUTDIR}/.done_figures",
+        lefse_done = f"{LEFSE_OUTDIR}/.done_pairwise",
+        pic_done   = ".done/_picrust2.done",
+        pic_pdf    = f"{PICRU}/plots_by_class/errorbar_by_class.pdf"
+    output:
+        html = f"{REPORT_DIR}/index.html"
+    params:
+        ma_outdir        = MA_OUTDIR,
+        ma_fig_dir       = f"{MA_OUTDIR}/99_Figures",
+        lefse_csv        = f"{LEFSE_OUTDIR}/lefse_de_output.csv",
+        lefse_dir        = LEFSE_OUTDIR,
+        picrust_plot_dir = f"{PICRU}/plots_by_class",
+        outdir           = REPORT_DIR,
+        py               = SCRIPT_BUILD_REPORT
+    shell:
+        r"""
+        set -euo pipefail
+        mkdir -p "{params.outdir}"
+        python3 "{params.py}" \
+          --ma_outdir "{params.ma_outdir}" \
+          --ma_fig_dir "{params.ma_fig_dir}" \
+          --lefse_csv "{params.lefse_csv}" \
+          --lefse_dir "{params.lefse_dir}" \
+          --picrust_plot_dir "{params.picrust_plot_dir}" \
+          --outdir "{params.outdir}" \
+          --mode copy
+        test -s "{output.html}"
+        """
+
+
+# ================================================================
+# junk file들 모아두기
+# ================================================================
+#
+from snakemake.shell import shell
+shell.executable("/bin/bash")
+
+
+FINAL_TARGETS = [
+    f"{REPORT_DIR}/index.html"
+]
+rule sweep_workspace:
+    input:
+        FINAL_TARGETS          # ✅ 이게 다 만들어진 다음에만 실행 가능
+    output:
+        touch(f"{JUNK_DIR}/.done_sweep")
+    params:
+        junk_dir = JUNK_DIR,
+        pats = "data.orig* data.prefilt* filt.data.orig* *.qs git data.proc* proc* data* orig.*"
+    shell:
+        r"""
+        set -euo pipefail
+        mkdir -p "{params.junk_dir}"
+
+        shopt -s nullglob dotglob
+
+        patterns=({params.pats})
+
+        for pat in "${{patterns[@]}}"; do
+          matches=( ./$pat )
+          (( ${{#matches[@]}} )) || continue
+
+          for f in "${{matches[@]}}"; do
+            base="$(basename "$f")"
+            case "$base" in
+              .|..|Snakefile|Snakefile_*|config.yaml|report|{params.junk_dir}) continue ;;
+            esac
+            [[ "$f" == "./{params.junk_dir}"* ]] && continue
+
+            mv -f -- "$f" "{params.junk_dir}/" || true
+          done
+        done
+
+        date > "{output}"
+        """
+
